@@ -548,19 +548,18 @@ export class AgentFS implements FileSystem {
 
     await assertReadableExistingInode(this.db, ino, 'open', normalizedPath);
 
-    const stmt = this.db.prepare(`
-      SELECT data FROM fs_data
-      WHERE ino = ?
-      ORDER BY chunk_index ASC
-    `);
-    const rows = await stmt.all(ino) as { data: Buffer }[];
+    const sizeStmt = this.db.prepare('SELECT size FROM fs_inode WHERE ino = ?');
+    const { size } = await sizeStmt.get(ino) as { size: number };
+    const stmt = this.db.prepare('SELECT chunk_index, data FROM fs_data WHERE ino = ?');
+    const rows = await stmt.all(ino) as { chunk_index: number; data: Buffer }[];
 
-    let combined: Buffer;
-    if (rows.length === 0) {
-      combined = this.bufferCtor.alloc(0);
-    } else {
-      const buffers = rows.map(row => row.data);
-      combined = this.bufferCtor.concat(buffers);
+    // Chunks may be short or missing (holes); bytes not covered by a chunk stay zero.
+    const combined = this.bufferCtor.alloc(size);
+    for (const row of rows) {
+      const start = row.chunk_index * this.chunkSize;
+      if (start < size) {
+        combined.set(row.data.subarray(0, size - start), start);
+      }
     }
 
     const now = Math.floor(Date.now() / 1000);
