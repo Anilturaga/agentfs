@@ -457,3 +457,43 @@ async def test_rename_of_a_deep_base_tree_and_symlink_sizes(tmp_path, overlay, b
         await fs.rename("/deep", "/deeper")
         await fs.rm("/deeper", recursive=True)
         assert await code(fs.stat("/deeper/a")) == "ENOENT"
+
+
+async def test_root_chmod_is_visible_without_reopen(overlay, base):
+    async with await open_merged(overlay, base) as fs:
+        await fs.chmod("/", 0o701)
+        assert (await fs.stat("/")).mode & 0o7777 == 0o701
+        assert (await fs.stat("/d/..")).mode & 0o7777 == 0o701
+    async with await open_merged(overlay, base) as fs:
+        assert (await fs.stat("/")).mode & 0o7777 == 0o701
+
+
+async def test_write_through_dangling_symlink_is_enoent(overlay, base):
+    (base / "dangling").symlink_to("missing")
+    async with await open_merged(overlay, base) as fs:
+        await fs.symlink("nowhere", "/mine")
+        for link in ("/dangling", "/mine"):
+            assert await code(fs.write_file(link, "x")) == "ENOENT"
+        await fs.write_file("/fresh", "x")
+        assert await fs.readdir("/") == ["d", "dangling", "e", "f", "fresh", "l", "mine", "p"]
+
+
+async def test_empty_pwrite_keeps_size_and_truncate_pads(overlay, base):
+    async with await open_merged(overlay, base) as fs:
+        await fs.write_file("/n", "abc")
+        for path in ("/f", "/n"):
+            handle = await fs.open(path)
+            await handle.pwrite(10, b"")
+            assert (await fs.stat(path)).size == (4 if path == "/f" else 3)
+        await handle.truncate(5)
+        assert await fs.read_file("/n", None) == b"abc\0\0"
+
+
+async def test_handle_after_ancestor_replaced_by_file_is_enoent(overlay, base):
+    async with await open_merged(overlay, base) as fs:
+        handle = await fs.open("/d/x")
+        await fs.rm("/d", recursive=True)
+        await fs.write_file("/d", "file")
+        assert await code(handle.pwrite(0, b"z")) == "ENOENT"
+        assert await code(handle.truncate(0)) == "ENOENT"
+        assert await fs.read_file("/d") == "file"

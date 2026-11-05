@@ -42,10 +42,6 @@ def _join(directory: str, name: str) -> str:
     return ("" if directory == "/" else directory) + "/" + name
 
 
-def _parent_of(path: str) -> str:
-    return path.rsplit("/", 1)[0] or "/"
-
-
 def _is_dir(stats: Stats | None) -> bool:
     return stats is not None and stats.is_directory()
 
@@ -393,7 +389,8 @@ class OverlayFS:
         kind = low.mode & S_IFMT
         if kind not in _TYPES:
             _fail("ENOTSUP", "open", path)
-        parent = await self._copy_up(await self._find(_parent_of(path), True, "open"))
+        parent_path, name = path.rsplit("/", 1)
+        parent = await self._copy_up(await self._find(parent_path or "/", True, "open"))
         ino = await self._delta._create_inode(low.mode, low.uid, low.gid)
         if kind == S_IFLNK:
             await self._write_link(ino, await self._lower.readlink(path))
@@ -404,7 +401,7 @@ class OverlayFS:
             db, "UPDATE fs_inode SET atime = ?, mtime = ?, ctime = ? WHERE ino = ?", *times, ino
         )
         await _run(db, "INSERT INTO fs_origin (delta_ino, lower_path) VALUES (?, ?)", ino, path)
-        await self._delta._create_dentry(parent, path.rsplit("/", 1)[1], ino)
+        await self._delta._create_dentry(parent, name, ino)
         self._by_delta[ino] = node.ino
         self._copied[node.ino] = ino
         del self._by_lower[path]
@@ -460,10 +457,17 @@ class OverlayFS:
         async with self._mutex:
             ino = self._delta_ino(node)
             if ino is None:
-                found = (await self._walk(node.path, False, "open"))[2]
+                try:
+                    found = (await self._walk(node.path, False, "open"))[2]
+                except ErrnoException as e:
+                    if e.code != "ENOTDIR":
+                        raise
+                    found = None
                 if found is None or found.ino != node.ino:
                     _fail("ENOENT", "open", node.path)
                 ino = await self._copy_up(found, keep_tail or offset > 0)
+            if keep_tail and not data:
+                return
             old = await self._delta._read_inode(ino)
             tail = old[offset + len(data) :] if keep_tail else b""
             head = old[:offset].ljust(offset, b"\0")
@@ -479,6 +483,8 @@ class OverlayFS:
         parent, name, node, dir_only, _ = await self._walk(path, True, "open")
         if dir_only or _is_dir(node and node.stats):
             _fail("EISDIR", "open", path)
+        if node is None and (await self._walk(path, False, "open"))[2]:
+            _fail("ENOENT", "open", path)
         ino = await (
             self._copy_up(node, False) if node else self._add(parent, name, DEFAULT_FILE_MODE)
         )
@@ -494,6 +500,8 @@ class OverlayFS:
         ino = await self._copy_up(await self._find(path, True, "chmod"))
         sql = "UPDATE fs_inode SET mode = (mode & ?) | ?, ctime = ? WHERE ino = ?"
         await _run(self._db, sql, S_IFMT, mode & 0o7777, int(time.time()), ino)
+        if ino == 1:
+            self._root = replace(self._root, stats=await self._stats(1, 1, "/"))
 
     write_file = _locked(_write_file)
     mkdir = _locked(_mkdir)
