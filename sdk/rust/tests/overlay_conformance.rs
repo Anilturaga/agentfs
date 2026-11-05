@@ -12,7 +12,7 @@ macro_rules! errnos {
     ($($name:ident),*) => { [$((stringify!($name), libc::$name)),*] };
 }
 const CASES: &str = include_str!("../../../conformance/overlay/cases.json");
-const LEGACY_RUST_FIXTURE: &str = concat!(
+const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/legacy_rust_overlay.db"
 );
@@ -42,26 +42,28 @@ fn field(s: &Stats, name: &str) -> String {
     }
 }
 
-/// `openMerged`: without a base, the one recorded in the database.
-async fn open_overlay(db: &Path, base: Option<&Path>) -> Result<OverlayFS> {
+/// `openMerged DB [BASE]`, or `reopen`. Without a base, the overlay uses the one in its database.
+async fn open_merged(fs: &mut Option<OverlayFS>, root: &Path, w: &[&str]) -> Result<String> {
+    let db = root.join(w.get(1).unwrap_or(&"db"));
     let mut options = AgentFSOptions::with_path(db.to_str().unwrap());
-    options.base = base.map(Into::into);
+    options.base = w.get(2).map(|b| root.join(b));
     let agent = AgentFS::open(options).await?;
     let base = agent
         .is_overlay_enabled()
         .await?
         .ok_or(FsError::InvalidPath)?;
-    let overlay = OverlayFS::new(Arc::new(HostFS::new(&base)?), agent.fs);
-    overlay.load().await?;
-    Ok(overlay)
+    *fs = Some(OverlayFS::new(Arc::new(HostFS::new(&base)?), agent.fs));
+    fs.as_ref().unwrap().load().await?;
+    Ok(String::new())
 }
 
 /// Runs `statement` on a separate connection; rows come back as `a|b; c|d`.
 async fn sql(db: &Path, statement: &str) -> Result<String> {
-    let built = turso::Builder::new_local(db.to_str().unwrap())
+    let conn = turso::Builder::new_local(db.to_str().unwrap())
         .build()
-        .await?;
-    let mut rows = built.connect()?.query(statement, ()).await?;
+        .await?
+        .connect()?;
+    let mut rows = conn.query(statement, ()).await?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await? {
         let cell = |i| match row.get_value(i).unwrap() {
@@ -82,8 +84,7 @@ async fn sql(db: &Path, statement: &str) -> Result<String> {
 
 /// Steps that need no overlay. Database paths are relative to `root`; host paths to the base.
 async fn run_aux(root: &Path, w: &[&str]) -> Result<String> {
-    let db = root.join(w[1]);
-    let host = &w[1][1..];
+    let (db, host) = (root.join(w[1]), &w[1][1..]);
     match w[0] {
         "hostRead" => return Ok(std::fs::read_to_string(host)?),
         "hostWrite" => std::fs::write(host, w[2..].join(" "))?,
@@ -91,12 +92,10 @@ async fn run_aux(root: &Path, w: &[&str]) -> Result<String> {
         "hostMkdir" => std::fs::create_dir(host)?,
         "plainDb" => drop(AgentFS::open(AgentFSOptions::with_path(db.to_str().unwrap())).await?),
         "legacyRust" => {
-            std::fs::copy(LEGACY_RUST_FIXTURE, &db)?;
-            let set = format!(
-                "UPDATE fs_overlay_config SET value = '{}' WHERE key = 'base_path'",
-                root.join(w[2]).display()
-            );
-            sql(&db, &set).await?;
+            std::fs::copy(FIXTURE, &db)?;
+            let b = root.join(w[2]).display().to_string();
+            let q = format!("UPDATE fs_overlay_config SET value = '{b}' WHERE key = 'base_path'");
+            sql(&db, &q).await?;
         }
         _ => return sql(&db, &w[2..].join(" ")).await,
     }
@@ -208,50 +207,37 @@ fn satisfied(want: Option<&str>, step_ok: bool, out: &str) -> bool {
 
 async fn run_steps(case: &Value, script: &str) -> std::result::Result<(), String> {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = dir.path();
     let base = root.join("base");
-    for sub in ["base", "other", "dir"] {
-        std::fs::create_dir(root.join(sub)).unwrap();
-    }
+    let _ = ["base", "other", "dir"].map(|d| std::fs::create_dir(root.join(d)).unwrap());
     std::env::set_current_dir(&base).unwrap();
     let setup = Command::new("sh").args(["-ec", script]).status().unwrap();
     assert!(setup.success(), "base setup failed");
-    let mut fs = Some(open_overlay(&root.join("db"), Some(&base)).await.unwrap());
+    let mut fs = None;
+    open_merged(&mut fs, root, &["openMerged", "db", "base"])
+        .await
+        .unwrap();
     let (mut handle, mut vars) = (None, Vec::<(&str, String)>::new());
     for step in case["steps"].as_array().unwrap() {
         let step = step.as_str().unwrap();
         let (cmd, want) = step
             .split_once("=>")
             .map_or((step, None), |(c, w)| (c, Some(w.trim())));
-        let is_word = |v: &str| v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
         let (var, cmd) = cmd
             .split_once(" = ")
-            .filter(|(v, _)| is_word(v))
+            .filter(|(v, _)| v.chars().all(|c| c.is_alphanumeric() || c == '_'))
             .map_or((None, cmd), |(v, c)| (Some(v), c));
-        let mut words: Vec<&str> = cmd.split_whitespace().collect();
-        if words[0] == "reopen" {
+        let words: Vec<&str> = cmd.split_whitespace().collect();
+        if matches!(words[0], "close" | "reopen") {
             (handle, fs) = (None, None);
-            words = vec!["openMerged", "db"];
         }
         let got = match words[0] {
-            "close" => {
-                (handle, fs) = (None, None);
-                Ok(String::new())
+            "close" => Ok(String::new()),
+            "openMerged" | "reopen" => open_merged(&mut fs, root, &words).await,
+            op if op.starts_with("host") || ["sql", "legacyRust", "plainDb"].contains(&op) => {
+                run_aux(root, &words).await
             }
-            "openMerged" => {
-                let base = words.get(2).map(|b| root.join(b));
-                let opened = open_overlay(&root.join(words[1]), base.as_deref()).await;
-                opened.map(|o| {
-                    fs = Some(o);
-                    String::new()
-                })
-            }
-            "sql" | "legacyRust" | "plainDb" | "hostRead" | "hostWrite" | "hostRm"
-            | "hostMkdir" => run_aux(&root, &words).await,
-            _ => match &fs {
-                Some(fs) => run_step(fs, &mut handle, &words).await,
-                None => Err(Error::Internal("no overlay is open".into())),
-            },
+            _ => run_step(fs.as_ref().expect("overlay is closed"), &mut handle, &words).await,
         };
         let out = got.as_ref().map_or_else(errno_name, |v| v.clone());
         let want = want.map(|w| {

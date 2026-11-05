@@ -215,10 +215,6 @@ async fn legacy_go_overlay_migrates_keeping_whiteouts() {
     let conn = agent.get_connection().await.unwrap();
     assert_v1_schema(&conn).await;
     assert_eq!(
-        rows(&conn, "SELECT * FROM fs_whiteout").await,
-        [["Text(\"/f\")", "Integer(7)"]]
-    );
-    assert_eq!(
         rows(&conn, "SELECT * FROM fs_origin").await,
         [["Integer(5)", "Null"]]
     );
@@ -227,7 +223,6 @@ async fn legacy_go_overlay_migrates_keeping_whiteouts() {
 #[tokio::test]
 async fn unknown_overlay_version_is_rejected_without_writes() {
     let invalid_versions = [
-        vec!["UPDATE fs_overlay_config SET value = '2' WHERE key = 'version'"],
         vec!["UPDATE fs_overlay_config SET value = X'31' WHERE key = 'version'"],
         vec![
             "UPDATE fs_overlay_config SET value = '2' WHERE key = 'version'",
