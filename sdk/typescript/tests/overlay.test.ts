@@ -338,6 +338,96 @@ describe('OverlayFS read path', () => {
       expect([await overlay.readFile('/f', 'utf8'), (await overlay.stat('/f')).size]).toEqual(['Base', 4]);
     });
 
+    it('does not follow a final directory symlink for a mutation that ends in a slash', async () => {
+      symlinkSync('d', join(base, 'aliasd'));
+      symlinkSync('e', join(base, 'aliase'));
+      overlay = await openMerged(db, base);
+      await overlay.symlink('e', '/delta-link');
+      const attempts = [
+        overlay.rename('/aliasd/', '/moved'), overlay.rename('/d', '/aliase/'), overlay.rmdir('/aliase/'),
+        overlay.rmdir('/delta-link/'), overlay.rm('/aliasd/', { recursive: true }), overlay.rename('/delta-link/', '/moved'),
+      ];
+      expect(await Promise.all(attempts.map(code))).toEqual(Array(6).fill('ENOTDIR'));
+      expect(await code(overlay.mkdir('/aliasd/'))).toBe('EEXIST');
+      expect(await code(overlay.rm('/d/.', { recursive: true }))).toBe('EINVAL');
+      expect((await overlay.lstat('/aliasd/')).isDirectory()).toBe(true);
+      expect(await overlay.readdir('/aliasd/')).toEqual(['sub', 'x']);
+      await overlay.close();
+      overlay = await openMerged(db);
+      expect(await overlay.readdir('/')).toEqual(['aliasd', 'aliase', 'd', 'delta-link', 'e', 'f', 'l', 'p']);
+      expect(await overlay.readFile('/d/x', 'utf8')).toBe('x');
+    });
+
+    it('rejects non-finite sizes, offsets and modes without changing the file', async () => {
+      overlay = await openMerged(db, base);
+      const h = await overlay.open('/f');
+      const rejected = [h.truncate(Infinity), h.truncate(NaN), h.truncate(1.5), h.pwrite(NaN, Buffer.from('x')), h.pread(NaN, 1), h.pread(0, -1), overlay.chmod('/f', NaN)];
+      expect(await Promise.all(rejected.map(code))).toEqual(Array(7).fill('EINVAL'));
+      expect(await text(overlay)).toBe('');
+      await h.pwrite(0, Buffer.from('B'));
+      expect(await code(h.truncate(Infinity))).toBe('EINVAL');
+      await overlay.close();
+      overlay = await openMerged(db);
+      expect([await overlay.readFile('/f', 'utf8'), (await overlay.stat('/f')).size]).toEqual(['Base', 4]);
+    });
+
+    it('finishes accepted mutations before close releases the lock', async () => {
+      let entered!: () => void;
+      let release!: () => void;
+      const reading = new Promise<void>((r) => (entered = r));
+      const blocked = new Promise<void>((r) => (release = r));
+      const host = await hostLower(base);
+      overlay = await openMerged(db, { ...host, read: async (...a) => (entered(), await blocked, host.read(...a)) });
+      const write = (await overlay.open('/f')).pwrite(0, Buffer.from('A'));
+      const queued = overlay.writeFile('/after', 'ok');
+      await reading;
+      const closing = overlay.close();
+      expect(await code(overlay.writeFile('/late', 'x'))).toBe('EBADF');
+      expect(await code(openMerged(db))).toBe('EBUSY');
+      release();
+      await Promise.all([write, queued, closing]);
+      overlay = await openMerged(db);
+      expect([await overlay.readFile('/f', 'utf8'), await overlay.readFile('/after', 'utf8')]).toEqual(['Aase', 'ok']);
+      await overlay.close();
+      overlay = undefined;
+      const raw = new Database(db);
+      await raw.connect();
+      const orphans = 'SELECT count(*) AS n FROM fs_inode i LEFT JOIN fs_dentry d ON d.ino = i.ino WHERE i.ino != 1 AND d.ino IS NULL';
+      expect(await raw.prepare(orphans).get()).toEqual({ n: 0 });
+      await raw.close();
+    });
+
+    it('keeps one merged inode for observers while a copy-up is in flight', async () => {
+      let entered!: () => void;
+      let release!: () => void;
+      const published = new Promise<void>((r) => (entered = r));
+      const blocked = new Promise<void>((r) => (release = r));
+      const real = new Database(db);
+      await real.connect();
+      const slow = new Proxy(real, {
+        get(target, key) {
+          const value = Reflect.get(target, key);
+          if (key !== 'prepare') return typeof value === 'function' ? value.bind(target) : value;
+          return (sql: string) => {
+            const stmt = target.prepare(sql);
+            if (!sql.includes('INSERT INTO fs_origin')) return stmt;
+            return new Proxy(stmt, {
+              get: (t, k) => (k === 'run' ? async (...a: unknown[]) => ((await t.run(...a)), entered(), blocked) : Reflect.get(t, k).bind(t)),
+            });
+          };
+        },
+      });
+      overlay = await openOnHandle(slow, await hostLower(base));
+      const first = await overlay.open('/f');
+      const before = (await first.fstat()).ino;
+      const write = first.pwrite(0, Buffer.from('A'));
+      await published;
+      const [during, second] = [await overlay.stat('/f'), await overlay.open('/f')];
+      release();
+      await write;
+      expect([during.ino, (await overlay.stat('/f')).ino, (await second.fstat()).ino]).toEqual([before, before, before]);
+    });
+
     it('refuses to copy up a lower FIFO and changes nothing', async () => {
       execFileSync('mkfifo', [join(base, 'd', 'fifo')]);
       overlay = await openMerged(db, base);

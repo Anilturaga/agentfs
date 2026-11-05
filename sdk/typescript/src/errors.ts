@@ -14,7 +14,8 @@ export type FsErrorCode =
   | 'EXDEV'     // Hard link across layers
   | 'ENOTSUP'   // Unsupported overlay format, special file, or lockless storage
   | 'ESTALE'    // Base does not match the overlay's recorded identity
-  | 'ELOOP';    // Too many symbolic links
+  | 'ELOOP'     // Too many symbolic links
+  | 'EBADF';    // Overlay is closed
 
 /**
  * Filesystem syscall names for error reporting.
