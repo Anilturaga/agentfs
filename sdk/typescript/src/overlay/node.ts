@@ -61,13 +61,13 @@ export async function createOverlay(dbPath: string, base: string | LowerAdapter)
   const db = new Database(dbPath);
   try {
     const lower = await lowerOf(base);
-    await db.connect();
+    await attach(db, dbPath, key);
     const { info } = await initOverlay(db, lower, Buffer);
     await db.close();
     return { path: dbPath, ...info };
   } catch (e) {
     await db.close().catch(() => {});
-    await unlink(dbPath);
+    await same(dbPath, key).then(() => unlink(dbPath), () => {});
     throw lockError(e);
   } finally {
     release(key);
@@ -159,7 +159,7 @@ async function configAt(path: string) {
   claim(key);
   const db = new Database(path, { readonly: true });
   try {
-    await db.connect();
+    await attach(db, path, key);
     return await readConfig(db);
   } finally {
     await db.close().catch(() => {});

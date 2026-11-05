@@ -196,12 +196,12 @@ describe('overlay management', () => {
     overlay = await openMerged(db, base);
   });
 
-  const replaceAfter = (method: 'connect' | 'close') => {
+  const replaceAfter = (method: 'connect' | 'close', path = db) => {
     const original = Database.prototype[method];
     vi.spyOn(Database.prototype, method).mockImplementation(async function (this: Database) {
       await original.call(this);
-      writeFileSync(db + '.new', 'replacement');
-      renameSync(db + '.new', db);
+      writeFileSync(path + '.new', 'replacement');
+      renameSync(path + '.new', path);
     });
   };
 
@@ -210,6 +210,19 @@ describe('overlay management', () => {
     replaceAfter('connect');
     expect(await code(rebindOverlay(db, base))).toBe('ENOENT');
     expect(readFileSync(db, 'utf8')).toBe('replacement');
+  });
+
+  it('does not create over, or list, a path that names another file after the open', async () => {
+    replaceAfter('connect');
+    expect(await code(createOverlay(db, base))).toBe('ENOENT');
+    expect(readFileSync(db, 'utf8')).toBe('replacement');
+    vi.restoreAllMocks();
+
+    const listed = join(root, 'listed.db');
+    await createOverlay(listed, base);
+    replaceAfter('connect', listed);
+    expect(await listOverlays(root)).toEqual([]);
+    expect(readFileSync(listed, 'utf8')).toBe('replacement');
   });
 
   it('refuses to unlink a path that was replaced during deleteOverlay', async () => {
