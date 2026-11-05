@@ -76,9 +76,6 @@ async fn persisted_whiteout_does_not_hide_a_delta_entry() {
 
     let overlay = open(&db, &base).await;
     create(&overlay, "n", "one").await;
-    drop(overlay);
-
-    let overlay = open(&db, &base).await;
     overlay
         .delta()
         .get_connection()
@@ -90,9 +87,27 @@ async fn persisted_whiteout_does_not_hide_a_delta_entry() {
         )
         .await
         .unwrap();
-    overlay.load().await.unwrap();
+    drop(overlay);
+
+    let overlay = open(&db, &base).await;
     assert_eq!(read(&overlay, "n").await.as_deref(), Some("one"));
     assert_eq!(overlay.readdir(1).await.unwrap().unwrap(), ["d", "f", "n"]);
+}
+
+#[tokio::test]
+async fn readdir_plus_inode_of_renamed_directory_is_usable() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = make_base(dir.path());
+    let overlay = open(&dir.path().join("o.db"), &base).await;
+
+    let d = overlay.lookup(1, "d").await.unwrap().unwrap();
+    overlay.create_file(d.ino, "n", 0o644, 0, 0).await.unwrap();
+    overlay.rename(1, "d", 1, "m").await.unwrap();
+
+    let entries = overlay.readdir_plus(1).await.unwrap().unwrap();
+    let m = entries.iter().find(|e| e.name == "m").unwrap();
+    assert!(overlay.getattr(m.stats.ino).await.unwrap().is_some());
+    assert!(overlay.lookup(m.stats.ino, "n").await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -109,4 +124,27 @@ async fn recreated_directory_stays_opaque_over_base() {
     let d = overlay.mkdir(1, "d", 0o755, 0, 0).await.unwrap();
     assert!(overlay.lookup(d.ino, "y").await.unwrap().is_none());
     assert!(overlay.readdir(d.ino).await.unwrap().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn opaque_directory_ignores_a_changed_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = make_base(dir.path());
+    let db = dir.path().join("o.db");
+
+    let overlay = open(&db, &base).await;
+    let d = overlay.lookup(1, "d").await.unwrap().unwrap();
+    overlay.unlink(d.ino, "x").await.unwrap();
+    overlay.rmdir(1, "d").await.unwrap();
+    let d = overlay.mkdir(1, "d", 0o755, 0, 0).await.unwrap();
+    overlay.create_file(d.ino, "n", 0o644, 0, 0).await.unwrap();
+    drop(overlay);
+
+    std::fs::remove_dir_all(base.join("d")).unwrap();
+    std::fs::write(base.join("d"), "now a file").unwrap();
+    let overlay = open(&db, &base).await;
+    let d = overlay.lookup(1, "d").await.unwrap().unwrap();
+    assert_eq!(overlay.readdir(d.ino).await.unwrap().unwrap(), ["n"]);
+    let entries = overlay.readdir_plus(d.ino).await.unwrap().unwrap();
+    assert_eq!(entries.len(), 1);
 }

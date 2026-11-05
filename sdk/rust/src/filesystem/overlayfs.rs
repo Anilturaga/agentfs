@@ -385,6 +385,43 @@ impl OverlayFS {
         }
     }
 
+    /// Overlay inode of a delta entry.
+    ///
+    /// The origin mapping only holds copy-ups made in this session. When the
+    /// origin has a live Base overlay inode, that inode is reused for stable
+    /// numbering and now points at the delta entry.
+    fn delta_overlay_ino(&self, delta_ino: i64, path: &str) -> i64 {
+        let ino = self.get_or_create_overlay_ino(Layer::Delta, delta_ino, path);
+        let origin_ino = self.get_origin_ino(delta_ino).and_then(|base_ino| {
+            let reverse = self.reverse_map.read().unwrap();
+            reverse.get(&(Layer::Base, base_ino)).copied()
+        });
+        let Some(existing_ino) = origin_ino else {
+            return ino;
+        };
+        self.refresh_overlay_mapping(existing_ino, Layer::Delta, delta_ino, path);
+        existing_ino
+    }
+
+    /// Inode of the base directory behind `info`. `None` if the base has no such
+    /// directory or a whiteout hides it.
+    async fn base_dir_ino(&self, info: &InodeInfo) -> Result<Option<i64>> {
+        if self.is_whiteout(&info.path) {
+            return Ok(None);
+        }
+        if info.layer == Layer::Base {
+            return Ok(Some(info.underlying_ino));
+        }
+        let mut ino: i64 = 1;
+        for comp in info.path.split('/').filter(|s| !s.is_empty()) {
+            match self.base.lookup(ino, comp).await? {
+                Some(s) => ino = s.ino,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(ino))
+    }
+
     /// Get inode info for an overlay inode
     fn get_inode_info(&self, ino: i64) -> Option<InodeInfo> {
         self.inode_map.read().unwrap().get(&ino).cloned()
@@ -705,28 +742,8 @@ impl FileSystem for OverlayFS {
             Some(ino) => self.delta.lookup(ino, name).await?,
             None => None,
         } {
-            let delta_ino = delta_stats.ino;
-            let ino = self.get_or_create_overlay_ino(Layer::Delta, delta_ino, &path);
             let mut stats = delta_stats;
-
-            // Origin mapping: reuse an existing Base overlay inode for stable
-            // numbering within a session.  The mapping only holds copy-ups made
-            // in this session, and is used only when the reverse_map contains a
-            // live entry.  Otherwise keep the Delta overlay inode — the downstream
-            // code already walks base from root when the parent is tagged Delta.
-            if let Some(base_ino) = self.get_origin_ino(stats.ino) {
-                let reverse = self.reverse_map.read().unwrap();
-                if let Some(existing_ino) = reverse.get(&(Layer::Base, base_ino)).copied() {
-                    drop(reverse);
-                    self.refresh_overlay_mapping(existing_ino, Layer::Delta, delta_ino, &path);
-                    stats.ino = existing_ino;
-                } else {
-                    stats.ino = ino;
-                }
-            } else {
-                stats.ino = ino;
-            }
-
+            stats.ino = self.delta_overlay_ino(stats.ino, &path);
             return Ok(Some(stats));
         }
 
@@ -816,30 +833,8 @@ impl FileSystem for OverlayFS {
             }
         }
 
-        // Get base entries (need to resolve base inode from path)
-        let base_ino = if info.layer == Layer::Base {
-            Some(info.underlying_ino)
-        } else {
-            // Walk base to find corresponding directory
-            let components: Vec<&str> = info.path.split('/').filter(|s| !s.is_empty()).collect();
-            let mut ino: i64 = 1;
-            let mut found_all = true;
-            for comp in &components {
-                if let Some(s) = self.base.lookup(ino, comp).await? {
-                    ino = s.ino;
-                } else {
-                    found_all = false;
-                    break;
-                }
-            }
-            if found_all {
-                Some(ino)
-            } else {
-                None
-            }
-        };
-
-        if let Some(base_ino) = base_ino {
+        // Get base entries
+        if let Some(base_ino) = self.base_dir_ino(&info).await? {
             if let Some(base_entries) = self.base.readdir(base_ino).await? {
                 for entry in base_entries {
                     let entry_path = if info.path == "/" {
@@ -867,28 +862,7 @@ impl FileSystem for OverlayFS {
         let mut entries_map: HashMap<String, DirEntry> = HashMap::new();
 
         // Get base entries first (so delta can override)
-        let base_ino = if info.layer == Layer::Base {
-            Some(info.underlying_ino)
-        } else {
-            let components: Vec<&str> = info.path.split('/').filter(|s| !s.is_empty()).collect();
-            let mut ino: i64 = 1;
-            let mut found_all = true;
-            for comp in &components {
-                if let Some(s) = self.base.lookup(ino, comp).await? {
-                    ino = s.ino;
-                } else {
-                    found_all = false;
-                    break;
-                }
-            }
-            if found_all {
-                Some(ino)
-            } else {
-                None
-            }
-        };
-
-        if let Some(base_ino) = base_ino {
+        if let Some(base_ino) = self.base_dir_ino(&info).await? {
             if let Some(base_entries) = self.base.readdir_plus(base_ino).await? {
                 for mut entry in base_entries {
                     let entry_path = if info.path == "/" {
@@ -919,19 +893,7 @@ impl FileSystem for OverlayFS {
                     } else {
                         format!("{}/{}", info.path, entry.name)
                     };
-                    // Check for origin mapping
-                    if let Some(base_ino) = self.get_origin_ino(entry.stats.ino) {
-                        entry.stats.ino =
-                            self.get_or_create_overlay_ino(Layer::Base, base_ino, &entry_path);
-                    } else {
-                        let overlay_ino = self.get_or_create_overlay_ino(
-                            Layer::Delta,
-                            entry.stats.ino,
-                            &entry_path,
-                        );
-                        entry.stats.ino = overlay_ino;
-                    }
-
+                    entry.stats.ino = self.delta_overlay_ino(entry.stats.ino, &entry_path);
                     entries_map.insert(entry.name.clone(), entry);
                 }
             }
