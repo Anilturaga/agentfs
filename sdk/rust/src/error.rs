@@ -76,6 +76,23 @@ pub enum Error {
     /// Schema version mismatch - database schema version doesn't match expected version
     #[error("schema version mismatch: database is version {found}, expected {expected}")]
     SchemaVersionMismatch { found: String, expected: String },
+
+    #[error("{msg}")]
+    Overlay { errno: i32, msg: String },
+}
+
+impl Error {
+    pub fn errno(&self) -> Option<i32> {
+        match self {
+            Error::Fs(e) => Some(e.to_errno()),
+            Error::Io(e) => e.raw_os_error(),
+            Error::Overlay { errno, .. } => Some(*errno),
+            Error::UnsupportedOverlayVersion(_) => Some(libc::ENOTSUP),
+            Error::BaseDirectoryNotFound(_) => Some(libc::ENOENT),
+            Error::NotADirectory(_) => Some(libc::ENOTDIR),
+            _ => None,
+        }
+    }
 }
 
 /// Result type alias using the SDK Error type.

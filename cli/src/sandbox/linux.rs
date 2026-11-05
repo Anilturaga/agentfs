@@ -16,7 +16,7 @@
 //! bypassing the FUSE mount entirely.
 
 use super::group_paths_by_parent;
-use agentfs_sdk::{AgentFS, AgentFSOptions, EncryptionConfig, HostFS, OverlayFS};
+use agentfs_sdk::{AgentFSOptions, Base, EncryptionConfig, HostFS};
 use anyhow::{bail, Context, Result};
 use std::{
     cmp::Reverse,
@@ -42,6 +42,7 @@ static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 /// First signal forwards to child, second signal sends SIGKILL.
 static TERM_SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
 
+use crate::cmd::init::open_session;
 use crate::mount::{is_mountpoint, mount_fs, MountBackend, MountHandle, MountOpts};
 
 /// Exit code returned when exec fails (standard shell convention for "command not found")
@@ -194,32 +195,22 @@ pub async fn run_cmd(
             cipher,
         });
     }
-    let agentfs = AgentFS::open(options)
-        .await
-        .context("Failed to create delta AgentFS")?;
-
+    let mountpoint_inode = fs::metadata(&session.fuse_mountpoint)
+        .map(|m| m.ino())
+        .context("Failed to get mountpoint inode")?;
     let hostfs = HostFS::new(&fd_path).context("Failed to create HostFS")?;
-    #[cfg(target_family = "unix")]
-    let hostfs = {
-        let mountpoint_inode = fs::metadata(&session.fuse_mountpoint)
-            .map(|m| m.ino())
-            .context("Failed to get mountpoint inode")?;
-        hostfs.with_fuse_mountpoint(mountpoint_inode)
+    let base = Base {
+        fs: Arc::new(hostfs.with_fuse_mountpoint(mountpoint_inode)),
+        ..Base::host(&cwd).context("Failed to open the base directory")?
     };
-
-    let base = Arc::new(hostfs);
-    let overlay = OverlayFS::new(base, agentfs.fs);
-
-    let cwd_str = cwd
-        .to_str()
-        .context("Current directory path contains non-UTF8 characters")?;
-    overlay
-        .init(cwd_str)
+    let cwd_str = base.path.clone();
+    let overlay = open_session(options, base)
         .await
-        .context("Failed to initialize overlay")?;
+        .context("Failed to open the session overlay")?
+        .fs;
 
     // Write the base path to a file for session joining
-    std::fs::write(&session.base_path_file, cwd_str)
+    std::fs::write(&session.base_path_file, &cwd_str)
         .context("Failed to write session base path")?;
 
     // SAFETY: getuid/getgid are always safe

@@ -5,7 +5,7 @@ use std::{
     fmt,
     time::{SystemTime, UNIX_EPOCH},
 };
-use turso::{Builder, Value};
+use turso::Value;
 
 /// Status of a tool call
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -74,8 +74,7 @@ pub struct ToolCalls {
 impl ToolCalls {
     /// Create a new tool calls tracker
     pub async fn new(db_path: &str) -> Result<Self> {
-        let db = Builder::new_local(db_path).build().await?;
-        let pool = ConnectionPool::new(db);
+        let pool = ConnectionPool::open_local(db_path, None).await?;
         let tc = Self { pool };
         tc.initialize().await?;
         Ok(tc)

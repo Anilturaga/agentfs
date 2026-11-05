@@ -16,7 +16,7 @@ pub use agentfs::AgentFS;
 pub use hostfs_darwin::HostFS;
 #[cfg(target_os = "linux")]
 pub use hostfs_linux::HostFS;
-pub use overlayfs::OverlayFS;
+pub use overlayfs::{Change, OverlayFS};
 
 /// Filesystem-specific errors with errno semantics
 #[derive(Debug, Error)]
@@ -317,5 +317,130 @@ pub trait FileSystem: Send + Sync {
     /// cache any resources per inode (like database-backed filesystems).
     async fn forget(&self, _ino: i64, _nlookup: u64) {
         // Default: no-op
+    }
+}
+
+/// The SDK path API ("Symlink Resolution" in SPEC.md) over any filesystem.
+pub struct PathFS(pub Arc<dyn FileSystem>);
+
+impl PathFS {
+    pub async fn resolve(&self, path: &str, follow_last: bool) -> Result<Stats> {
+        let names = |p: &str| -> Vec<String> {
+            let parts = p.rsplit('/').filter(|c| !c.is_empty() && *c != ".");
+            parts.map(Into::into).collect()
+        };
+        let (mut parts, mut trail, mut links) = (names(path), vec![1], 0);
+        while let Some(name) = parts.pop() {
+            let dir = *trail.last().unwrap();
+            if name == ".." {
+                if trail.len() > 1 {
+                    trail.pop();
+                }
+                continue;
+            }
+            let stats = self.0.lookup(dir, &name).await?.ok_or(FsError::NotFound)?;
+            if stats.is_symlink() && (follow_last || !parts.is_empty()) {
+                links += 1;
+                if links > 40 {
+                    return Err(FsError::SymlinkLoop.into());
+                }
+                let target = self.0.readlink(stats.ino).await?.unwrap_or_default();
+                if target.starts_with('/') {
+                    trail.truncate(1);
+                }
+                parts.extend(names(&target));
+            } else if parts.is_empty() {
+                return Ok(stats);
+            } else if stats.is_directory() {
+                trail.push(stats.ino);
+            } else {
+                return Err(FsError::NotADirectory.into());
+            }
+        }
+        let dir = *trail.last().unwrap();
+        Ok(self.0.getattr(dir).await?.ok_or(FsError::NotFound)?)
+    }
+
+    pub async fn stat(&self, path: &str) -> Result<Option<Stats>> {
+        match self.resolve(path, true).await {
+            Err(crate::error::Error::Fs(FsError::NotFound)) => Ok(None),
+            stats => stats.map(Some),
+        }
+    }
+
+    pub async fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        let Some(stats) = self.stat(path).await? else {
+            return Ok(None);
+        };
+        let file = self.0.open(stats.ino, libc::O_RDONLY).await?;
+        Ok(Some(file.pread(0, stats.size as u64).await?))
+    }
+
+    /// Replaces the content of the file at `path`, creating it with mode 0644 if absent.
+    pub async fn write_file(&self, path: &str, data: &[u8]) -> Result<()> {
+        let file = match self.stat(path).await? {
+            Some(stats) => self.0.open(stats.ino, libc::O_RDWR).await?,
+            None => {
+                let (dir, name) = self.creation_site(path).await?;
+                let created = self.0.create_file(dir, &name, DEFAULT_FILE_MODE, 0, 0);
+                created.await?.1
+            }
+        };
+        file.truncate(0).await?;
+        file.pwrite(0, data).await
+    }
+
+    pub async fn mkdir(&self, path: &str) -> Result<()> {
+        let (dir, name) = self.split(path).await?;
+        self.0
+            .mkdir(dir, name, DEFAULT_DIR_MODE, 0, 0)
+            .await
+            .map(drop)
+    }
+
+    pub async fn remove(&self, path: &str) -> Result<()> {
+        let (dir, name) = self.split(path).await?;
+        match self.0.lookup(dir, name).await?.ok_or(FsError::NotFound)? {
+            stats if stats.is_directory() => self.0.rmdir(dir, name).await,
+            _ => self.0.unlink(dir, name).await,
+        }
+    }
+
+    pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let ((dir, name), (new_dir, new_name)) = (self.split(from).await?, self.split(to).await?);
+        self.0.rename(dir, name, new_dir, new_name).await
+    }
+
+    async fn creation_site(&self, path: &str) -> Result<(i64, String)> {
+        let mut path = path.to_string();
+        for _ in 0..=40 {
+            let (dir, name) = self.split(&path).await?;
+            let link = match self.0.lookup(dir, name).await? {
+                Some(link) if link.is_symlink() => link,
+                _ => return Ok((dir, name.to_string())),
+            };
+            let target = self.0.readlink(link.ino).await?.unwrap_or_default();
+            let parent = path
+                .trim_end_matches('/')
+                .rsplit_once('/')
+                .map_or("", |(p, _)| p);
+            path = match target.starts_with('/') {
+                true => target,
+                false => format!("{parent}/{target}"),
+            };
+        }
+        Err(FsError::SymlinkLoop.into())
+    }
+
+    async fn split<'a>(&self, path: &'a str) -> Result<(i64, &'a str)> {
+        let path = path.trim_end_matches('/');
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if matches!(name, "" | "." | "..") {
+            return Err(FsError::InvalidPath.into());
+        }
+        match self.resolve(dir, true).await? {
+            parent if parent.is_directory() => Ok((parent.ino, name)),
+            _ => Err(FsError::NotADirectory.into()),
+        }
     }
 }

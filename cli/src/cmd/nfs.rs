@@ -4,14 +4,12 @@
 //! filesystem over the network, allowing remote systems (like VMs) to mount
 //! it as their root filesystem.
 
-use agentfs_sdk::{agentfs_dir, AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use agentfs_sdk::{agentfs_dir, AgentFSOptions};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::signal;
-use tokio::sync::Mutex;
 
-use crate::cmd::init::open_agentfs;
+use crate::cmd::init::open_fs;
 use crate::nfs::AgentNFS;
 
 /// Handle the `nfs` command - start a standalone NFS server.
@@ -24,27 +22,12 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
         .to_str()
         .context("Database path contains non-UTF8 characters")?;
 
-    let options = AgentFSOptions::with_path(db_path_str);
-    let agentfs = open_agentfs(options).await?;
-
-    // Check if overlay is configured in the database
-    let base_path = agentfs
-        .is_overlay_enabled()
-        .await
-        .context("Failed to check overlay config")?;
-
-    // Create filesystem - either direct AgentFS or overlay with base
-    let fs: Arc<Mutex<dyn FileSystem>> = if let Some(base_str) = base_path {
-        let hostfs = HostFS::new(&base_str)?;
-        let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
-        overlay.load().await?;
-
-        eprintln!("Mode: overlay (base: {})", base_str);
-        Arc::new(Mutex::new(overlay))
-    } else {
-        eprintln!("Mode: direct AgentFS");
-        Arc::new(Mutex::new(agentfs.fs))
-    };
+    let opened = open_fs(AgentFSOptions::with_path(db_path_str), None).await?;
+    match opened.base() {
+        Some(base) => eprintln!("Mode: overlay (base: {})", base),
+        None => eprintln!("Mode: direct AgentFS"),
+    }
+    let fs = opened.mutex();
 
     // Create NFS adapter
     let nfs = AgentNFS::new(fs);

@@ -160,8 +160,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeline_empty() {
-        let (_agentfs, path, _file) = create_test_agentfs().await;
+        let (agentfs, path, _file) = create_test_agentfs().await;
 
+        drop(agentfs);
         let mut buf = Vec::new();
         show_timeline(&mut buf, &path, &default_options())
             .await
@@ -177,6 +178,7 @@ mod tests {
 
         agentfs.tools.start("test_tool", None).await.unwrap();
 
+        drop(agentfs);
         let mut buf = Vec::new();
         show_timeline(&mut buf, &path, &default_options())
             .await
@@ -196,6 +198,7 @@ mod tests {
         agentfs.tools.start("tool_a", None).await.unwrap();
         agentfs.tools.start("tool_b", None).await.unwrap();
 
+        drop(agentfs);
         let mut buf = Vec::new();
         let options = TimelineOptions {
             filter: Some("tool_a".to_string()),
@@ -239,6 +242,7 @@ mod tests {
         agentfs.tools.start("test_tool", None).await.unwrap();
 
         // Test status="success" returns only successful calls
+        drop(agentfs);
         let mut buf = Vec::new();
         let options = TimelineOptions {
             status: Some("success".to_string()),
@@ -292,6 +296,7 @@ mod tests {
         }
 
         // Test limit=2 returns exactly 2 calls
+        drop(agentfs);
         let mut buf = Vec::new();
         let options = TimelineOptions {
             limit: 2,
@@ -318,6 +323,7 @@ mod tests {
             .await
             .unwrap();
 
+        drop(agentfs);
         let mut buf = Vec::new();
         show_timeline(&mut buf, &path, &default_options())
             .await

@@ -1,6 +1,4 @@
-use agentfs_sdk::{AgentFS, AgentFSOptions, Stats};
-
-const S_IFREG: u32 = 0o100000;
+use agentfs_sdk::{DirEntry, PathFS, Stats};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
@@ -10,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::cmd::init::open_agentfs;
+use crate::cmd::init::{open_fs, resolve_db, Opened};
 
 /// Main entry point for MCP server command
 pub async fn handle_mcp_server_command(
@@ -18,17 +16,17 @@ pub async fn handle_mcp_server_command(
     tools_filter: Option<Vec<String>>,
 ) -> Result<()> {
     // Resolve and open AgentFS
-    let options = AgentFSOptions::resolve(&id_or_path).context(format!(
+    let options = resolve_db(&id_or_path, None).context(format!(
         "Failed to resolve agent ID or path: {}",
         id_or_path
     ))?;
 
     eprintln!("Using agent: {}", id_or_path);
 
-    let agentfs = open_agentfs(options).await?;
+    let opened = open_fs(options, None).await?;
 
     // Create MCP server with tool filtering
-    let server = McpServer::new(agentfs, tools_filter);
+    let server = McpServer::new(opened, tools_filter);
 
     // Run server with stdio transport
     eprintln!("Starting MCP server on stdio...");
@@ -40,12 +38,13 @@ pub async fn handle_mcp_server_command(
 
 /// MCP Server implementation
 struct McpServer {
-    agentfs: Arc<AgentFS>,
+    opened: Opened,
+    fs: PathFS,
     enabled_tools: Option<HashSet<String>>,
 }
 
 impl McpServer {
-    fn new(agentfs: AgentFS, tools_filter: Option<Vec<String>>) -> Self {
+    fn new(opened: Opened, tools_filter: Option<Vec<String>>) -> Self {
         let enabled_tools = tools_filter.map(|tools| {
             let set: HashSet<String> = tools.into_iter().collect();
             eprintln!("Tool filter enabled. Exposing tools: {:?}", set);
@@ -57,7 +56,8 @@ impl McpServer {
         }
 
         Self {
-            agentfs: Arc::new(agentfs),
+            fs: PathFS(opened.arc()),
+            opened,
             enabled_tools,
         }
     }
@@ -645,7 +645,6 @@ impl McpServer {
         let path = normalize_path(&params.path)?;
 
         let data = self
-            .agentfs
             .fs
             .read_file(&path)
             .await
@@ -675,17 +674,8 @@ impl McpServer {
             Box::pin(self.ensure_parent_dirs(&path)).await?;
         }
 
-        // Remove file if it exists (overwrite behavior)
-        if self.agentfs.fs.stat(&path).await?.is_some() {
-            self.agentfs.fs.remove(&path).await?;
-        }
-        let (_, file) = self
-            .agentfs
-            .fs
-            .create_file(&path, S_IFREG | 0o644, 0, 0)
-            .await
-            .context("Failed to create file")?;
-        file.pwrite(0, &data)
+        self.fs
+            .write_file(&path, &data)
             .await
             .context("Failed to write file")?;
 
@@ -708,7 +698,7 @@ impl McpServer {
             let parent_path = normalize_path(&parent_str)?;
 
             // Check if parent exists
-            if self.agentfs.fs.stat(&parent_path).await?.is_some() {
+            if self.fs.stat(&parent_path).await?.is_some() {
                 return Ok(());
             }
 
@@ -716,9 +706,8 @@ impl McpServer {
             self.ensure_parent_dirs(&parent_path).await?;
 
             // Create parent
-            self.agentfs
-                .fs
-                .mkdir(&parent_path, 0, 0)
+            self.fs
+                .mkdir(&parent_path)
                 .await
                 .context(format!("Failed to create directory: {}", parent_path))?;
 
@@ -731,7 +720,6 @@ impl McpServer {
         let path = normalize_path(&params.path)?;
 
         let stats = self
-            .agentfs
             .fs
             .stat(&path)
             .await
@@ -739,8 +727,8 @@ impl McpServer {
             .ok_or_else(|| anyhow::anyhow!("Directory not found: {}", path))?;
 
         let entries = self
-            .agentfs
-            .fs
+            .opened
+            .arc()
             .readdir(stats.ino)
             .await
             .context("Failed to read directory")?
@@ -753,9 +741,8 @@ impl McpServer {
     async fn handle_mkdir(&self, params: MkdirParams) -> Result<String> {
         let path = normalize_path(&params.path)?;
 
-        self.agentfs
-            .fs
-            .mkdir(&path, 0, 0)
+        self.fs
+            .mkdir(&path)
             .await
             .context("Failed to create directory")?;
 
@@ -766,8 +753,7 @@ impl McpServer {
     async fn handle_remove(&self, params: RemoveParams) -> Result<String> {
         let path = normalize_path(&params.path)?;
 
-        self.agentfs
-            .fs
+        self.fs
             .remove(&path)
             .await
             .context("Failed to remove directory")?;
@@ -780,8 +766,7 @@ impl McpServer {
         let from = normalize_path(&params.from)?;
         let to = normalize_path(&params.to)?;
 
-        self.agentfs
-            .fs
+        self.fs
             .rename(&from, &to)
             .await
             .context("Failed to rename")?;
@@ -794,7 +779,6 @@ impl McpServer {
         let path = normalize_path(&params.path)?;
 
         let stats = self
-            .agentfs
             .fs
             .stat(&path)
             .await
@@ -808,7 +792,7 @@ impl McpServer {
     async fn handle_access(&self, params: AccessParams) -> Result<String> {
         let path = normalize_path(&params.path)?;
 
-        let exists = self.agentfs.fs.stat(&path).await?.is_some();
+        let exists = self.fs.stat(&path).await?.is_some();
 
         Ok(serde_json::to_string(&json!({ "exists": exists }))?)
     }
@@ -816,8 +800,8 @@ impl McpServer {
     /// Get KV value
     async fn handle_kv_get(&self, params: KvGetParams) -> Result<String> {
         let value: Option<JsonValue> = self
-            .agentfs
-            .kv
+            .opened
+            .kv()
             .get(&params.key)
             .await
             .context("Failed to get value")?;
@@ -827,8 +811,8 @@ impl McpServer {
 
     /// Set KV value
     async fn handle_kv_set(&self, params: KvSetParams) -> Result<String> {
-        self.agentfs
-            .kv
+        self.opened
+            .kv()
             .set(&params.key, &params.value)
             .await
             .context("Failed to set value")?;
@@ -838,8 +822,8 @@ impl McpServer {
 
     /// Delete KV value
     async fn handle_kv_delete(&self, params: KvDeleteParams) -> Result<String> {
-        self.agentfs
-            .kv
+        self.opened
+            .kv()
             .delete(&params.key)
             .await
             .context("Failed to delete key")?;
@@ -861,26 +845,21 @@ impl McpServer {
         resources: &'a mut Vec<JsonValue>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            let dir_stats = match self.agentfs.fs.stat(path).await? {
+            let dir_stats = match self.fs.stat(path).await? {
                 Some(s) => s,
                 None => return Ok(()),
             };
 
-            let entries = match self.agentfs.fs.readdir(dir_stats.ino).await? {
+            let entries = match self.opened.arc().readdir_plus(dir_stats.ino).await? {
                 Some(entries) => entries,
                 None => return Ok(()),
             };
 
-            for entry in entries {
+            for DirEntry { name: entry, stats } in entries {
                 let full_path = if path == "/" {
                     format!("/{}", entry)
                 } else {
                     format!("{}/{}", path, entry)
-                };
-
-                let stats = match self.agentfs.fs.stat(&full_path).await? {
-                    Some(s) => s,
-                    None => continue,
                 };
 
                 if stats.is_file() {
@@ -905,7 +884,6 @@ impl McpServer {
         let normalized = normalize_path(path)?;
 
         let data = self
-            .agentfs
             .fs
             .read_file(&normalized)
             .await
@@ -952,5 +930,31 @@ impl From<Stats> for StatsResponse {
             is_directory: stats.is_directory(),
             is_symlink: stats.is_symlink(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentfs_sdk::{create_overlay, open_merged, AgentFSOptions, Base};
+
+    #[tokio::test]
+    async fn read_file_sees_base_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(base.join("f.txt"), "from base").unwrap();
+        let db = AgentFSOptions::with_path(dir.path().join("o.db").to_str().unwrap());
+        create_overlay(db.clone(), &Base::host(&base).unwrap())
+            .await
+            .unwrap();
+
+        let merged = open_merged(db, None).await.unwrap();
+        let server = McpServer::new(Opened::Merged(merged), None);
+        let params = ReadFileParams {
+            path: "/f.txt".to_string(),
+            encoding: None,
+        };
+        assert_eq!(server.handle_read_file(params).await.unwrap(), "from base");
     }
 }
