@@ -6,7 +6,7 @@
     {"id": 3, "xfail": [9], "steps": ["write /f new", "read /f => new", "hostRead /f => base", "diff => M f /f"]},
     {"id": 4, "steps": ["open /f", "write /f new", "hread => new"]},
     {"id": 5, "xfail": [9], "steps": ["chmod /f 600", "reopen", "stat /f mode => 600", "diff => M f /f"]},
-    {"id": 6, "xfail": [8, 9], "steps": ["i = stat /d ino", "write /d/x x2", "plus / d ino => $i", "stat /d mode => 750", "diff => M d /d; M f /d/x"]},
+    {"id": 6, "xfail": [8, 9], "steps": ["write /d/x x2", "stat /d mode => 750", "diff => M d /d; M f /d/x"]},
     {"id": 7, "xfail": [9], "steps": ["write /d/n n", "readdir /d => n sub x", "diff => M d /d; A f /d/n"]},
     {"id": 8, "xfail": [9], "steps": ["unlink /f", "stat /f => ENOENT", "readdir / => d e l p", "diff => D f /f"]},
     {"id": 9, "xfail": [9], "steps": ["unlink /f", "write /f again", "reopen", "read /f => again", "diff => M f /f"]},
@@ -41,6 +41,7 @@
     {"id": 38, "xfail": [9], "steps": ["createOverlay dir/a.db /dev/shm", "openMerged dir/a.db /dev => ESTALE", "listOverlays dir /dev =>"]},
     {"id": 39, "xfail": [9], "steps": ["write /d/x x2", "close", "hostWrite /f edited", "hostWrite /d/x b2", "openMerged db", "read /f => edited", "read /d/x => x2", "diff => M d /d; M f /d/x"]},
     {"id": 40, "xfail": [9], "steps": ["write /f new", "close", "hostRm /f", "hostMkdir /f", "hostWrite /f/x x", "openMerged db", "diff => M f /f; D f /f/x"]},
-    {"id": 41, "xfail": [9], "steps": ["createOverlay dir/a.db base", "openMerged dir/a.db base", "write /n 1", "close", "openMerged dir/a.db other => ESTALE", "rebindOverlay dir/a.db other", "openMerged dir/a.db", "read /n => 1"]}
+    {"id": 41, "xfail": [9], "steps": ["createOverlay dir/a.db base", "openMerged dir/a.db base", "write /n 1", "close", "openMerged dir/a.db other => ESTALE", "rebindOverlay dir/a.db other", "openMerged dir/a.db", "read /n => 1"]},
+    {"id": 42, "xfail": [8], "steps": ["i = stat /d ino", "write /d/x x2", "stat /d ino => $i", "plus / d ino => $i"]}
   ]
 }
