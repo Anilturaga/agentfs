@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from turso.aio import connect
 
+import agentfs_sdk.overlay as overlay_module
 from agentfs_sdk import (
     AgentFS,
     AgentFSOptions,
@@ -108,6 +109,22 @@ OPEN_CODE = """
             print(e.code)
     asyncio.run(main())
 """
+
+
+DELETE = """
+    from agentfs_sdk import delete_overlay
+    async def main():
+        try:
+            await delete_overlay(sys.argv[1])
+        except OSError as e:
+            print(e.code)
+    asyncio.run(main())
+"""
+
+
+def child_delete_code(db) -> str:
+    """The error code of `delete_overlay` in another process; empty if it deleted."""
+    return child(DELETE, str(db)).communicate(timeout=30)[0].strip()
 
 
 def child_open_code(db, base) -> str:
@@ -650,3 +667,51 @@ async def test_management_releases_lock(tmp_path, base, overlay):
     await rebind_overlay(overlay, other)
     assert child_opens(overlay, other)
     assert await code(open_merged(overlay, base)) == "ESTALE"
+
+
+async def test_listing_does_not_resurrect_deleted_database(tmp_path, base, overlay, monkeypatch):
+    real_open, deleted = os.open, []
+
+    def delete_before_open(path, *args, **kwargs):
+        if str(path) == str(overlay) and not deleted:
+            deleted.append(child_delete_code(overlay))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", delete_before_open)
+    assert await list_overlays(tmp_path) == []
+    monkeypatch.undo()
+    assert deleted == [""]
+    assert not overlay.exists()
+    await create_overlay(overlay, base)
+
+
+async def test_listing_pins_database_against_delete(tmp_path, base, overlay, monkeypatch):
+    real_connect, deleted = overlay_module.connect, []
+
+    def delete_before_connect(path):
+        deleted.append(child_delete_code(overlay))
+        return real_connect(path)
+
+    monkeypatch.setattr(overlay_module, "connect", delete_before_connect)
+    assert [i.path for i in await list_overlays(tmp_path)] == [str(overlay)]
+    monkeypatch.undo()
+    assert deleted == ["EBUSY"]
+    assert overlay.exists()
+
+
+async def test_listing_skips_entries_that_disappear(tmp_path, overlay, monkeypatch):
+    gone, notes = tmp_path / "gone.db", tmp_path / "notes.txt"
+    gone.write_text("x")
+    notes.write_text("x")
+    seen, real_lstat = [], os.lstat
+
+    def vanish(path, *args, **kwargs):
+        seen.append(Path(path).name)
+        if Path(path) == gone:
+            gone.unlink()
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", vanish)
+    assert [i.path for i in await list_overlays(tmp_path)] == [str(overlay)]
+    monkeypatch.undo()
+    assert "gone.db" in seen and "notes.txt" not in seen
