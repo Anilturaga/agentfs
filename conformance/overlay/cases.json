@@ -19,7 +19,7 @@
     {"id": 16, "xfail": [7], "steps": ["write /n 1", "link /n /n2", "rename /n /n2", "stat /n", "stat /n2"]},
     {"id": 17, "xfail": [9], "steps": ["rename /f /g", "stat /f => ENOENT", "read /g => base", "diff => D f /f; A f /g"]},
     {"id": 18, "xfail": [7, 9], "steps": ["rename /d /m", "reopen", "readdir /m => sub x", "read /m/sub/y => y", "stat /d => ENOENT", "diff => D d /d; D d /d/sub; D f /d/sub/y; D f /d/x; A d /m; A d /m/sub; A f /m/sub/y; A f /m/x"]},
-    {"id": 19, "xfail": [7], "steps": ["rename /d /m", "mkdir /d", "readdir /d =>"]},
+    {"id": 19, "steps": ["rename /d /m", "mkdir /d", "readdir /d =>"]},
     {"id": 20, "xfail": [7, 9], "steps": ["rename /d /e", "readdir /e => sub x", "stat /d => ENOENT", "diff => D d /d; D d /d/sub; D f /d/sub/y; D f /d/x; M d /e; A d /e/sub; A f /e/sub/y; A f /e/x"]},
     {"id": 21, "xfail": [9], "steps": ["rename /f /d/x", "read /d/x => base", "stat /f => ENOENT", "diff => M d /d; M f /d/x; D f /f"]},
     {"id": 22, "xfail": [7], "steps": ["rename /d /d/sub/z => EINVAL", "rename /e /d => ENOTEMPTY", "rename /f /e => EISDIR", "rename /e /f => ENOTDIR"]},

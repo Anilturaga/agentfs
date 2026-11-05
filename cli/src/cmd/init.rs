@@ -164,20 +164,7 @@ pub async fn init_database(
         .await
         .context("Failed to initialize database")?;
 
-    // If base is provided, initialize the overlay schema using the SDK
     if let Some(ref base_path) = base {
-        let base_path_str = base_path
-            .canonicalize()
-            .context("Failed to canonicalize base path")?
-            .to_string_lossy()
-            .to_string();
-
-        // Use SDK's OverlayFS::init_schema to ensure schema consistency
-        let conn = agent.get_connection().await?;
-        OverlayFS::init_schema(&conn, &base_path_str)
-            .await
-            .context("Failed to initialize overlay schema")?;
-
         if agent.is_synced() {
             agent.push().await?;
         }
