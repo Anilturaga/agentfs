@@ -115,6 +115,38 @@ describe("Filesystem Integration Tests", () => {
       expect(await fs.readFile("/file2.txt", "utf8")).toBe("content 2");
       expect(await fs.readFile("/file3.txt", "utf8")).toBe("content 3");
     });
+
+    // Lays out a file the way Rust does: chunk i at i * chunkSize, short or missing chunks are holes, fs_inode.size is the length.
+    async function insertSparseFile(name: string, size: number, chunks: Record<number, number[]>) {
+      const { ino } = (await db
+        .prepare(
+          "INSERT INTO fs_inode (mode, nlink, size, atime, mtime, ctime) VALUES (?, 1, ?, 0, 0, 0) RETURNING ino"
+        )
+        .get(0o100644, size)) as { ino: number };
+      await db.prepare("INSERT INTO fs_dentry (name, parent_ino, ino) VALUES (?, 1, ?)").run(name, ino);
+      for (const [index, bytes] of Object.entries(chunks)) {
+        await db
+          .prepare("INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)")
+          .run(ino, Number(index), Buffer.from(bytes));
+      }
+    }
+
+    it("should zero-fill a short trailing chunk up to the stored size", async () => {
+      await insertSparseFile("short.bin", 10, { 0: [120] });
+      const data = (await fs.readFile("/short.bin")) as Buffer;
+      expect([...data]).toEqual([120, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    });
+
+    it("should place chunks at their offsets and zero-fill missing chunks", async () => {
+      const cs = fs.getChunkSize();
+      await insertSparseFile("holes.bin", cs * 3 + 2, { 0: [1], 2: [7, 8] });
+      const data = (await fs.readFile("/holes.bin")) as Buffer;
+      const expected = Buffer.alloc(cs * 3 + 2);
+      expected[0] = 1;
+      expected[cs * 2] = 7;
+      expected[cs * 2 + 1] = 8;
+      expect(data.equals(expected)).toBe(true);
+    });
   });
 
   describe("Directory Operations", () => {
