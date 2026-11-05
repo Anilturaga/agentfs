@@ -543,6 +543,15 @@ impl OverlayFS {
         Ok(Some(ino))
     }
 
+    /// Delta inode of the delta entry `name` in the directory behind `parent`
+    async fn delta_entry(&self, parent: &InodeInfo, name: &str) -> Result<Option<i64>> {
+        Ok(match self.resolve_delta_parent(parent).await? {
+            Some(dir) => FileSystem::lookup(&self.delta, dir, name).await?,
+            None => None,
+        }
+        .map(|s| s.ino))
+    }
+
     /// Ensure parent directories exist in delta layer
     async fn ensure_parent_dirs(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
         let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -1271,42 +1280,22 @@ impl FileSystem for OverlayFS {
         if (oldparent_ino, oldname) == (newparent_ino, newname) {
             return Ok(());
         }
-        if new_path.starts_with(&format!("{old_path}/")) {
-            return Err(FsError::InvalidRename.into());
-        }
-        if let Some(dst) = self.lookup(newparent_ino, newname).await? {
-            let shared = dst.ino == src_stats.ino;
-            if shared && matches!(self.get_inode_info(dst.ino), Some(i) if i.layer == Layer::Delta)
-            {
-                return Ok(());
-            }
-            if dst.is_directory() != src_stats.is_directory() {
-                return Err(match dst.is_directory() {
-                    true => FsError::IsADirectory,
-                    false => FsError::NotADirectory,
-                }
-                .into());
-            }
-            if dst.is_directory() && !self.readdir(dst.ino).await?.unwrap_or_default().is_empty() {
-                return Err(FsError::NotEmpty.into());
-            }
+        let src_delta = self.delta_entry(&old_parent_info, oldname).await?;
+        if src_delta.is_some() && src_delta == self.delta_entry(&new_parent_info, newname).await? {
+            return Ok(());
         }
 
-        // Collect the lower-backed entries of the merged subtree, parents first, and
-        // refuse before any copy-up if one of them is a special file. An entry is
-        // lower-backed if its directory has no delta dentry for it.
-        let src_delta = match self.resolve_delta_parent(&old_parent_info).await? {
-            Some(dir) => FileSystem::lookup(&self.delta, dir, oldname).await?,
-            None => None,
-        };
+        // Collect the lower-backed entries of the merged subtree, parents first. An
+        // entry is lower-backed if its directory has no delta dentry for it. A
+        // directory in the subtree that is the new parent makes D a descendant of S.
         let mut lower = Vec::new();
-        let mut pending = vec![(old_path.clone(), src_stats, src_delta.map(|s| s.ino))];
+        let mut pending = vec![(old_path.clone(), src_stats.clone(), src_delta)];
         while let Some((path, stats, delta_ino)) = pending.pop() {
+            if stats.is_directory() && stats.ino == newparent_ino {
+                return Err(FsError::InvalidRename.into());
+            }
             if delta_ino.is_none() {
-                if !(stats.is_file() || stats.is_directory() || stats.is_symlink()) {
-                    return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into());
-                }
-                lower.push((path.clone(), stats.ino));
+                lower.push((path.clone(), stats.clone()));
             }
             if stats.is_directory() {
                 for entry in self.readdir_plus(stats.ino).await?.unwrap_or_default() {
@@ -1319,12 +1308,30 @@ impl FileSystem for OverlayFS {
                 }
             }
         }
+        if let Some(dst) = self.lookup(newparent_ino, newname).await? {
+            if dst.is_directory() != src_stats.is_directory() {
+                return Err(match dst.is_directory() {
+                    true => FsError::IsADirectory,
+                    false => FsError::NotADirectory,
+                }
+                .into());
+            }
+            if dst.is_directory() && !self.readdir(dst.ino).await?.unwrap_or_default().is_empty() {
+                return Err(FsError::NotEmpty.into());
+            }
+        }
+        if lower
+            .iter()
+            .any(|(_, s)| !(s.is_file() || s.is_directory() || s.is_symlink()))
+        {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into());
+        }
         // Lower hard links share one overlay inode, so copy up by path: the entry
         // that owns the inode mapping follows into the delta, the others copy alone.
-        for (path, ino) in lower {
-            match self.get_inode_info(ino) {
+        for (path, stats) in lower {
+            match self.get_inode_info(stats.ino) {
                 Some(i) if i.layer == Layer::Base && i.path == path => {
-                    self.copy_up_and_update_mapping(ino).await?;
+                    self.copy_up_and_update_mapping(stats.ino).await?;
                 }
                 _ => {
                     let base_ino = self.lower_ino(&path).await?.ok_or(FsError::NotFound)?;
@@ -1334,7 +1341,9 @@ impl FileSystem for OverlayFS {
             }
         }
 
-        self.ensure_parent_dirs(&new_path, 0, 0).await?;
+        if new_parent_info.layer == Layer::Base {
+            self.ensure_parent_dirs(&new_path, 0, 0).await?;
+        }
 
         // Resolve delta parents AFTER copy_up / ensure_parent_dirs,
         // since those create the parent directories in delta.
@@ -3114,6 +3123,52 @@ mod tests {
             assert_ne!(mode_of(&overlay, m.ino, "x2").await?, 0o600);
             assert_ne!(mode_of(&overlay, ROOT_INO, "o").await?, 0o600);
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_rename_between_lower_and_delta_hard_link_aliases() -> Result<()> {
+        for (from, to) in [("x", "x2"), ("x2", "x")] {
+            let base_dir = hard_linked_base()?;
+            let delta_dir = tempdir()?;
+            let db = delta_dir.path().join("delta.db");
+
+            let overlay = open_overlay(base_dir.path(), &db).await?;
+            let d = overlay.lookup(ROOT_INO, "d").await?.unwrap();
+            let x = overlay.lookup(d.ino, "x").await?.unwrap();
+            overlay.chmod(x.ino, 0o600).await?;
+            overlay.rename(d.ino, from, d.ino, to).await?;
+
+            for overlay in [overlay, open_overlay(base_dir.path(), &db).await?] {
+                let d = overlay.lookup(ROOT_INO, "d").await?.unwrap();
+                assert_eq!(overlay.readdir(d.ino).await?.unwrap(), [to]);
+                let lower = std::fs::metadata(base_dir.path().join("d/x2"))?;
+                let mode = if from == "x" {
+                    0o600
+                } else {
+                    lower.mode() & 0o777
+                };
+                assert_eq!(mode_of(&overlay, d.ino, to).await?, mode);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_rename_into_saved_dir_that_moved_away() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+        let n = overlay.mkdir(ROOT_INO, "n", 0o755, 0, 0).await?;
+        let sub = overlay.mkdir(n.ino, "sub", 0o755, 0, 0).await?;
+        overlay.rename(ROOT_INO, "n", ROOT_INO, "m").await?;
+        overlay.mkdir(ROOT_INO, "n", 0o755, 0, 0).await?;
+
+        overlay.rename(ROOT_INO, "n", sub.ino, "new").await?;
+
+        let new = overlay.lookup(sub.ino, "new").await?.unwrap();
+        assert!(overlay.readdir(new.ino).await?.unwrap().is_empty());
+        assert!(overlay.lookup(ROOT_INO, "n").await?.is_none());
 
         Ok(())
     }
