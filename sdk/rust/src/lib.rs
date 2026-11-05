@@ -354,15 +354,21 @@ impl AgentFS {
         // Check schema version for existing databases
         let conn = pool.get_connection().await?;
         schema::check_schema_version(&conn).await?;
-        drop(conn);
 
-        // Initialize overlay schema if base is provided
-        if let Some(base_path) = options.base {
-            let canonical_base = std::fs::canonicalize(base_path)?;
-            let base_path_str = canonical_base.to_string_lossy().to_string();
-            let conn = pool.get_connection().await?;
-            OverlayFS::init_schema(&conn, &base_path_str).await?;
+        // Open the overlay schema at v1 (migrating legacy databases) for the given
+        // base, or for the base recorded in an existing overlay database
+        let base_path = match options.base {
+            Some(base_path) => Some(
+                std::fs::canonicalize(base_path)?
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            None => OverlayFS::config_value(&conn, "base_path").await?,
+        };
+        if let Some(base_path) = base_path {
+            OverlayFS::init_schema(&conn, &base_path).await?;
         }
+        drop(conn);
 
         Self::open_with_pool(pool, sync_db).await
     }

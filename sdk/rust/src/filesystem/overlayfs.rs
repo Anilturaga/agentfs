@@ -1,7 +1,8 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
 use async_trait::async_trait;
 use std::{
     collections::{HashMap, HashSet},
+    os::unix::fs::MetadataExt,
     sync::{
         atomic::{AtomicI64, Ordering},
         Arc, RwLock,
@@ -17,6 +18,12 @@ use super::{
 
 /// Root inode number (matches FUSE convention)
 const ROOT_INO: i64 = 1;
+
+/// Overlay format version written by this SDK.
+const OVERLAY_VERSION: &str = "1";
+
+const WHITEOUT_TABLE: &str = "fs_whiteout (path TEXT PRIMARY KEY, created_at INTEGER NOT NULL)";
+const ORIGIN_TABLE: &str = "fs_origin (delta_ino INTEGER PRIMARY KEY, lower_path TEXT)";
 
 /// Which layer an inode belongs to
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,7 +63,7 @@ pub struct OverlayFS {
     next_ino: AtomicI64,
     /// Set of whiteout paths (deleted from base)
     whiteouts: RwLock<HashSet<String>>,
-    /// Origin mapping: delta_ino -> base_ino (for copy-up consistency)
+    /// Origins of copy-ups made in this session: delta_ino -> base_ino
     origin_map: RwLock<HashMap<i64, i64>>,
 }
 
@@ -91,37 +98,87 @@ impl OverlayFS {
         }
     }
 
-    /// Initialize the overlay filesystem schema
+    /// Read a value of `fs_overlay_config`; `None` if the table or the key is absent.
+    pub(crate) async fn config_value(conn: &Connection, key: &str) -> Result<Option<String>> {
+        if !Self::has_column(conn, "fs_overlay_config", "key").await? {
+            return Ok(None);
+        }
+        let mut rows = conn
+            .query(
+                "SELECT value FROM fs_overlay_config WHERE key = ?1",
+                [key.to_string()],
+            )
+            .await?;
+        Ok(match rows.next().await? {
+            Some(row) => match row.get_value(0)? {
+                Value::Text(s) => Some(s),
+                _ => None,
+            },
+            None => None,
+        })
+    }
+
+    async fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+        let sql = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'");
+        Ok(conn.query(&sql, ()).await?.next().await?.is_some())
+    }
+
+    /// Open the overlay schema at format v1 over the host directory `base_path`.
+    ///
+    /// A database without a version is initialized or migrated in one transaction.
+    /// A database with an unknown version fails without being written.
     pub async fn init_schema(conn: &Connection, base_path: &str) -> Result<()> {
+        match Self::config_value(conn, "version").await? {
+            Some(v) if v == OVERLAY_VERSION => return Ok(()),
+            Some(v) => return Err(Error::UnsupportedOverlayVersion(v)),
+            None => {}
+        }
+        let base = std::fs::metadata(base_path)?;
+        let identity = format!("host:{}:{}", base.dev(), base.ino());
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        match Self::migrate(conn, base_path, &identity).await {
+            Ok(()) => conn.execute("COMMIT", ()).await.map(drop)?,
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn migrate(conn: &Connection, base_path: &str, identity: &str) -> Result<()> {
+        let mut steps = Vec::new();
+        if Self::has_column(conn, "fs_whiteout", "parent_path").await? {
+            steps.push("DROP INDEX IF EXISTS idx_fs_whiteout_parent");
+            steps.push("ALTER TABLE fs_whiteout DROP COLUMN parent_path");
+        }
+        if Self::has_column(conn, "fs_origin", "base_ino").await? {
+            steps.push("ALTER TABLE fs_origin DROP COLUMN base_ino");
+            steps.push("ALTER TABLE fs_origin ADD COLUMN lower_path TEXT");
+        }
+        for sql in steps {
+            conn.execute(sql, ()).await?;
+        }
+        for table in [WHITEOUT_TABLE, ORIGIN_TABLE] {
+            conn.execute(&format!("CREATE TABLE IF NOT EXISTS {table}"), ())
+                .await?;
+        }
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS fs_whiteout (
-                path TEXT PRIMARY KEY,
-                created_at INTEGER NOT NULL
-            )",
+            "CREATE TABLE IF NOT EXISTS fs_overlay_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
             (),
         )
         .await?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS fs_overlay_config (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )",
-            (),
-        )
-        .await?;
-        conn.execute(
-            "INSERT OR REPLACE INTO fs_overlay_config (key, value) VALUES ('base_path', ?1)",
-            [Value::Text(base_path.to_string())],
-        )
-        .await?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS fs_origin (
-                delta_ino INTEGER PRIMARY KEY,
-                base_ino INTEGER NOT NULL
-            )",
-            (),
-        )
-        .await?;
+        for (key, value) in [
+            ("base_path", base_path),
+            ("base_identity", identity),
+            ("version", OVERLAY_VERSION),
+        ] {
+            conn.execute(
+                "INSERT OR REPLACE INTO fs_overlay_config (key, value) VALUES (?1, ?2)",
+                [key.to_string(), value.to_string()],
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -130,7 +187,6 @@ impl OverlayFS {
         let conn = self.delta.get_connection().await?;
         Self::init_schema(&conn, base_path).await?;
         self.load_whiteouts(&conn).await?;
-        self.load_origins(&conn).await?;
         Ok(())
     }
 
@@ -159,35 +215,11 @@ impl OverlayFS {
         self.load_whiteouts(&conn).await
     }
 
-    /// Load persisted state (whiteouts and origin mappings) from database.
+    /// Load persisted whiteouts from database.
     /// Call this after creating an OverlayFS for an existing database.
     pub async fn load(&self) -> Result<()> {
         let conn = self.delta.get_connection().await?;
-        self.load_whiteouts(&conn).await?;
-        self.load_origins(&conn).await?;
-        Ok(())
-    }
-
-    /// Load origin mappings from database
-    async fn load_origins(&self, conn: &Connection) -> Result<()> {
-        let result = conn
-            .query("SELECT delta_ino, base_ino FROM fs_origin", ())
-            .await;
-        if let Ok(mut rows) = result {
-            let mut mappings = Vec::new();
-            while let Some(row) = rows.next().await? {
-                let delta_ino = row.get_value(0).ok().and_then(|v| v.as_integer().copied());
-                let base_ino = row.get_value(1).ok().and_then(|v| v.as_integer().copied());
-                if let (Some(d), Some(b)) = (delta_ino, base_ino) {
-                    mappings.push((d, b));
-                }
-            }
-            let mut origins = self.origin_map.write().unwrap();
-            for (d, b) in mappings {
-                origins.insert(d, b);
-            }
-        }
-        Ok(())
+        self.load_whiteouts(&conn).await
     }
 
     /// Check if a path is whiteout (deleted from base)
@@ -365,12 +397,17 @@ impl OverlayFS {
         &self.delta
     }
 
-    /// Store origin mapping for copy-up
-    async fn add_origin_mapping(&self, delta_ino: i64, base_ino: i64) -> Result<()> {
+    /// Record the origin of a copy-up: the base path that was copied
+    async fn add_origin_mapping(
+        &self,
+        delta_ino: i64,
+        base_ino: i64,
+        lower_path: &str,
+    ) -> Result<()> {
         let conn = self.delta.get_connection().await?;
         conn.execute(
-            "INSERT OR REPLACE INTO fs_origin (delta_ino, base_ino) VALUES (?, ?)",
-            (delta_ino, base_ino),
+            "INSERT OR REPLACE INTO fs_origin (delta_ino, lower_path) VALUES (?, ?)",
+            (delta_ino, lower_path),
         )
         .await?;
         self.origin_map.write().unwrap().insert(delta_ino, base_ino);
@@ -488,7 +525,8 @@ impl OverlayFS {
             // Create origin mapping if directory exists in base, so that
             // lookups return consistent overlay inodes
             if let Some(base_ino) = origin_base_ino {
-                self.add_origin_mapping(new_stats.ino, base_ino).await?;
+                self.add_origin_mapping(new_stats.ino, base_ino, &current_path)
+                    .await?;
                 // Promote the overlay inode to delta so readdir/unlink will check delta
                 self.promote_to_delta(&current_path, new_stats.ino);
             }
@@ -593,7 +631,7 @@ impl OverlayFS {
         };
 
         // Store origin mapping
-        self.add_origin_mapping(delta_ino, base_ino).await?;
+        self.add_origin_mapping(delta_ino, base_ino, path).await?;
 
         Ok(delta_ino)
     }
@@ -657,11 +695,10 @@ impl FileSystem for OverlayFS {
             let mut stats = delta_stats;
 
             // Origin mapping: reuse an existing Base overlay inode for stable
-            // numbering within a session.  After remount the base_ino stored in
-            // the mapping may be stale (the new HostFS has a fresh inode cache),
-            // so only use it when the reverse_map already contains a live entry.
-            // Otherwise keep the Delta overlay inode — the downstream code
-            // already walks base from root when the parent is tagged Delta.
+            // numbering within a session.  The mapping only holds copy-ups made
+            // in this session, and is used only when the reverse_map contains a
+            // live entry.  Otherwise keep the Delta overlay inode — the downstream
+            // code already walks base from root when the parent is tagged Delta.
             if let Some(base_ino) = self.get_origin_ino(stats.ino) {
                 let reverse = self.reverse_map.read().unwrap();
                 if let Some(existing_ino) = reverse.get(&(Layer::Base, base_ino)).copied() {
