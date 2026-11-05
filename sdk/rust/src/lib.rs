@@ -359,14 +359,17 @@ impl AgentFS {
         OverlayFS::check_version(&conn).await?;
 
         // Open the overlay schema at v1 (migrating legacy databases) for the given
-        // base, or for the base recorded in an existing overlay database
+        // base, or for the base recorded in an existing overlay database if it still
+        // exists. A database whose recorded base is gone stays as it is.
         let base_path = match options.base {
             Some(base_path) => Some(
                 std::fs::canonicalize(base_path)?
                     .to_string_lossy()
                     .to_string(),
             ),
-            None => OverlayFS::config_value(&conn, "base_path").await?,
+            None => OverlayFS::config_value(&conn, "base_path")
+                .await?
+                .filter(|p| std::path::Path::new(p).exists()),
         };
         if let Some(base_path) = base_path {
             OverlayFS::init_schema(&conn, &base_path).await?;

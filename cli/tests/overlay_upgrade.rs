@@ -25,6 +25,21 @@ fn diff(db: &std::path::Path) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+#[test]
+fn diff_of_legacy_overlay_with_missing_base_names_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("legacy.db");
+    std::fs::copy(LEGACY_RUST_FIXTURE, &db).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentfs"))
+        .arg("diff")
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("base directory does not exist: /tmp/agentfs-legacy-fixture-base"));
+}
+
 #[tokio::test]
 async fn diff_is_identical_before_and_after_legacy_upgrade() {
     let dir = tempfile::tempdir().unwrap();

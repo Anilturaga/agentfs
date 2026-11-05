@@ -142,7 +142,10 @@ impl OverlayFS {
         if Self::check_version(conn).await? {
             return Ok(());
         }
-        let base = std::fs::metadata(base_path)?;
+        let base = std::fs::metadata(base_path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Error::BaseDirectoryNotFound(base_path.to_string()),
+            _ => e.into(),
+        })?;
         let identity = format!("host:{}:{}", base.dev(), base.ino());
         conn.execute("BEGIN IMMEDIATE", ()).await?;
         match Self::migrate(conn, base_path, &identity).await {
