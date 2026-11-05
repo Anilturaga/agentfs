@@ -30,7 +30,6 @@ fn errno(code: i32) -> Error {
     std::io::Error::from_raw_os_error(code).into()
 }
 
-/// Identity of the host directory `path`: `host:<st_dev>:<st_ino>`.
 pub(crate) fn host_identity(path: &str) -> Result<String> {
     let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => Error::BaseDirectoryNotFound(path.to_string()),
@@ -426,8 +425,7 @@ impl OverlayFS {
         Ok(out)
     }
 
-    /// Add a deletion for each entry below the base directory `lower` that the delta directory
-    /// `delta` does not hold, or for every entry without one.
+    /// Add a deletion for each entry below `lower` that the delta directory `delta` lacks.
     async fn deleted_below(
         &self,
         delta: Option<i64>,

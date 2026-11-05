@@ -35,7 +35,6 @@ pub use overlay::{
 pub use schema::{SchemaVersion, AGENTFS_SCHEMA_VERSION};
 pub use toolcalls::{ToolCall, ToolCallStats, ToolCallStatus, ToolCalls};
 
-/// Open the local database file at `path` with turso. The caller owns the file's reservation.
 pub(crate) async fn open_local(
     path: &str,
     enc: Option<&EncryptionConfig>,
@@ -320,7 +319,6 @@ impl AgentFS {
         Self::open_held(options, None).await
     }
 
-    /// Like `open`, with the database file already reserved by the caller as `held`.
     pub(crate) async fn open_held(
         options: AgentFSOptions,
         held: Option<Arc<dyn Any + Send + Sync>>,
@@ -345,7 +343,6 @@ impl AgentFS {
         let db_path = options.db_path()?;
         let meta_path = format!("{db_path}-info");
 
-        // Every engine open of a file on disk goes behind a reservation
         let existed = Path::new(&db_path).exists();
         let held = match held {
             None => connection_pool::ConnectionPool::reserve(&db_path)?,

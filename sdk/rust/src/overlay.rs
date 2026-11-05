@@ -1,5 +1,4 @@
 //! Overlay management: create, open, list, rebind and delete overlay databases.
-//!
 //! Turso's `F_SETLK` lock belongs to the process, and closing any descriptor of the file drops
 //! it. Every open of a database file therefore goes through a [`Reservation`]: a registry entry
 //! keyed by the file's inode and a lock of our own, held until the last handle drops.
@@ -41,7 +40,6 @@ impl Base {
     }
 }
 
-/// What an overlay database records about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayInfo {
     pub path: PathBuf,
@@ -52,8 +50,7 @@ pub struct OverlayInfo {
     pub base_identity: String,
 }
 
-/// An open overlay. The database stays reserved until this, and every handle cloned from
-/// `fs` or `kv`, is dropped.
+/// An open overlay. The database stays reserved until this and its cloned handles drop.
 pub struct MergedFS {
     pub fs: OverlayFS,
     pub kv: KvStore,
@@ -139,9 +136,8 @@ pub(crate) struct Reservation {
 }
 
 impl Reservation {
-    /// Like `acquire`, after creating the file if it is absent. `create_new` fails without
-    /// opening a descriptor when the file exists, so a held database keeps its lock. The
-    /// descriptor of a new file becomes the reservation's, or is parked if another one wins.
+    /// Like `acquire`, after creating the file if it is absent. The descriptor of a new file
+    /// becomes the reservation's, or is parked if another opener wins.
     pub(crate) fn acquire_or_create(path: &str) -> Result<Self> {
         let created = OpenOptions::new()
             .read(true)
@@ -299,9 +295,9 @@ async fn build(
     info.ok_or_else(|| not_overlay(&path.display().to_string()))
 }
 
-/// Opens the overlay `db`, creating nothing: `ENOENT` if the file is absent. A legacy overlay is
-/// migrated. Without `base`, the base recorded in the database is used. `ESTALE` if the base is
-/// not the recorded one, `EINVAL` if the database is not an overlay and `EBUSY` if it is in use.
+/// Opens the overlay `db`, migrating a legacy one. Without `base`, the recorded base is used.
+/// `ENOENT` if the file is absent, `ESTALE` if the base is not the recorded one, `EINVAL` if
+/// it is not an overlay and `EBUSY` if it is in use.
 pub async fn open_merged(db: AgentFSOptions, base: Option<Base>) -> Result<MergedFS> {
     let path = db.db_path()?;
     let held = Arc::new(Reservation::acquire(Path::new(&path))?);
@@ -386,8 +382,8 @@ pub async fn list_overlays(dir: impl AsRef<Path>, base: Option<&Base>) -> Result
     Ok(found)
 }
 
-/// Deletes the overlay database `db` and its sidecar files: `ENOENT` if it is absent, `EINVAL`
-/// if it is not an overlay and `EBUSY` if it is in use.
+/// Deletes the overlay database `db` and its sidecar files. `ENOENT`, `EINVAL` and `EBUSY` as
+/// for `open_merged`.
 pub async fn delete_overlay(db: AgentFSOptions) -> Result<()> {
     let path = db.db_path()?;
     let held = Arc::new(Reservation::acquire(Path::new(&path))?);
@@ -412,8 +408,7 @@ pub async fn delete_overlay(db: AgentFSOptions) -> Result<()> {
     Ok(std::fs::remove_file(&path)?)
 }
 
-/// Binds the overlay `db` to `base`. `EINVAL` if `db` has no format version, `ENOTSUP` if the
-/// version is not 1, `EBUSY` if it is in use.
+/// Binds the overlay `db` to `base`. `ENOTSUP` if its version is not 1.
 pub async fn rebind_overlay(db: AgentFSOptions, base: &Base) -> Result<()> {
     let path = db.db_path()?;
     let held = Arc::new(Reservation::acquire(Path::new(&path))?);

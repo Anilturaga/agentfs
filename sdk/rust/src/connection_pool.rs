@@ -73,12 +73,10 @@ impl ConnectionPool {
         }
     }
 
-    /// Keep `held` alive until the pool, and every handle that shares it, is gone.
     pub(crate) fn hold(&self, held: Arc<dyn Any + Send + Sync>) {
         let _ = self.inner.keep.set(held);
     }
 
-    /// Reserve the file at `path`, creating it if absent. `None` for an in-memory database.
     pub(crate) fn reserve(path: &str) -> Result<Option<Arc<dyn Any + Send + Sync>>> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if path != ":memory:" {
@@ -166,23 +164,23 @@ impl Drop for ConnectionPoolInner {
     /// A hard link of a database file has sidecars of its own, so a reserved database has its
     /// log checkpointed into the file before the reservation ends.
     fn drop(&mut self) {
-        if let (DatabaseType::Local(db), Some(_)) = (&self.db, self.keep.get()) {
-            let db = db.clone();
-            let checkpoint = std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .build()
-                    .unwrap();
-                rt.block_on(async {
-                    let mut rows = db
-                        .connect()?
-                        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
-                        .await?;
-                    while rows.next().await?.is_some() {}
-                    Ok::<_, turso::Error>(())
-                })
-            });
-            let _ = checkpoint.join();
-        }
+        let (DatabaseType::Local(db), Some(_)) = (&self.db, self.keep.get()) else {
+            return;
+        };
+        let db = db.clone();
+        let _ = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().build().ok()?;
+            rt.block_on(async {
+                let conn = db.connect().ok()?;
+                let mut rows = conn
+                    .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+                    .await
+                    .ok()?;
+                while rows.next().await.ok()?.is_some() {}
+                Some(())
+            })
+        })
+        .join();
     }
 }
 

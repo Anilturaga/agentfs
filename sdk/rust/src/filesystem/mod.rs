@@ -321,8 +321,6 @@ pub trait FileSystem: Send + Sync {
 }
 
 /// The SDK path API ("Symlink Resolution" in SPEC.md) over any filesystem.
-///
-/// `.` is skipped, `..` goes to the parent and at most 40 symlinks are followed.
 pub struct PathFS(pub Arc<dyn FileSystem>);
 
 impl PathFS {
@@ -414,8 +412,7 @@ impl PathFS {
         self.0.rename(dir, name, new_dir, new_name).await
     }
 
-    /// Where a file written to the missing `path` is created: the parent directory and name
-    /// that the last name reaches when it is a dangling symlink.
+    /// Where a file written to the missing `path` is created, through dangling symlinks.
     async fn creation_site(&self, path: &str) -> Result<(i64, String)> {
         let mut path = path.to_string();
         for _ in 0..=40 {

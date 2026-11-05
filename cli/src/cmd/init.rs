@@ -88,8 +88,7 @@ impl Opened {
     }
 }
 
-/// Open the database over `base`, or over the base it records. A database that is not an
-/// overlay, or does not exist yet, opens as a plain filesystem.
+/// Open the database over `base` or its recorded base; a non-overlay opens as plain.
 pub async fn open_fs(options: AgentFSOptions, base: Option<Base>) -> Result<Opened, SdkError> {
     let exists = options.db_path().is_ok_and(|db| Path::new(&db).exists());
     if base.is_none() && !exists {
@@ -106,8 +105,8 @@ pub async fn open_fs(options: AgentFSOptions, base: Option<Base>) -> Result<Open
     }
 }
 
-/// Open the overlay of an `agentfs run` session over `base`, creating it on the first run.
-/// A later run over another directory fails with `ESTALE`.
+/// Open the overlay of an `agentfs run` session, creating it on the first run. A later run
+/// over another directory fails with `ESTALE`.
 pub async fn open_session(options: AgentFSOptions, base: Base) -> Result<MergedFS, SdkError> {
     if !options.db_path().is_ok_and(|db| Path::new(&db).exists()) {
         match create_overlay(options.clone(), &base).await {
