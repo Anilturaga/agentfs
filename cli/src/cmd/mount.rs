@@ -173,7 +173,7 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
                 let hostfs = HostFS::new(&base_path)?;
                 let hostfs = hostfs.with_fuse_mountpoint(mountpoint_ino);
                 let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
-                overlay.load().await?; // Load persisted whiteouts and origin mappings
+                overlay.load().await?;
                 Ok::<Arc<dyn FileSystem>, anyhow::Error>(Arc::new(overlay))
             } else {
                 // Plain AgentFS
@@ -251,7 +251,7 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
         eprintln!("Using overlay filesystem with base: {}", base_path);
         let hostfs = HostFS::new(&base_path)?;
         let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
-        overlay.load().await?; // Load persisted whiteouts and origin mappings
+        overlay.load().await?;
         Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
     } else {
         // Plain AgentFS

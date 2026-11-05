@@ -37,7 +37,7 @@ pub async fn handle_nfs_command(id_or_path: String, bind: String, port: u32) -> 
     let fs: Arc<Mutex<dyn FileSystem>> = if let Some(base_str) = base_path {
         let hostfs = HostFS::new(&base_str)?;
         let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
-        overlay.load().await?; // Load persisted whiteouts and origin mappings
+        overlay.load().await?;
 
         eprintln!("Mode: overlay (base: {})", base_str);
         Arc::new(Mutex::new(overlay))
