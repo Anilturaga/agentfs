@@ -1,5 +1,6 @@
 """Error types for filesystem operations"""
 
+import errno
 from typing import Literal, Optional
 
 # POSIX-style error codes for filesystem operations
@@ -12,6 +13,11 @@ FsErrorCode = Literal[
     "EPERM",  # Operation not permitted
     "EINVAL",  # Invalid argument
     "ENOSYS",  # Function not implemented (use for symlinks)
+    "ELOOP",  # Too many symbolic links
+    "EXDEV",  # Cross-layer link
+    "ENOTSUP",  # Operation not supported
+    "EBUSY",  # Overlay database already open
+    "ESTALE",  # Base identity changed
 ]
 
 # Filesystem syscall names for error reporting
@@ -27,11 +33,21 @@ FsSyscall = Literal[
     "scandir",
     "copyfile",
     "access",
+    "lstat",
+    "readlink",
+    "symlink",
+    "link",
+    "chmod",
+    "create_overlay",
+    "open_merged",
+    "list_overlays",
+    "delete_overlay",
+    "rebind_overlay",
 ]
 
 
-class ErrnoException(Exception):
-    """Exception with errno-style attributes
+class ErrnoException(OSError):
+    """OSError with errno-style attributes
 
     Args:
         code: POSIX error code (e.g., 'ENOENT')
@@ -55,6 +71,7 @@ class ErrnoException(Exception):
         suffix = f" '{path}'" if path is not None else ""
         error_message = f"{code}: {base}, {syscall}{suffix}"
         super().__init__(error_message)
+        self.errno = getattr(errno, code)
         self.code = code
         self.syscall = syscall
         self.path = path

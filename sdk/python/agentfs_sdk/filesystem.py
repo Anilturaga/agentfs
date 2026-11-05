@@ -459,7 +459,19 @@ class Filesystem:
         normalized_path, ino = await self._resolve_path_or_throw(path, "open")
 
         await assert_readable_existing_inode(self._db, ino, "open", normalized_path)
+        combined = await self._read_inode(ino)
 
+        # Update atime
+        now = int(time.time())
+        await self._db.execute("UPDATE fs_inode SET atime = ? WHERE ino = ?", (now, ino))
+        await self._db.commit()
+
+        if encoding:
+            return combined.decode(encoding)
+        return combined
+
+    async def _read_inode(self, ino: int) -> bytes:
+        """Read an inode's full content without touching its timestamps"""
         cursor = await self._db.execute("SELECT size FROM fs_inode WHERE ino = ?", (ino,))
         size = (await cursor.fetchone())[0]
 
@@ -474,16 +486,7 @@ class Filesystem:
             if start < size:
                 data = data[: min(self._chunk_size, size - start)]
                 buffer[start : start + len(data)] = data
-        combined = bytes(buffer)
-
-        # Update atime
-        now = int(time.time())
-        await self._db.execute("UPDATE fs_inode SET atime = ? WHERE ino = ?", (now, ino))
-        await self._db.commit()
-
-        if encoding:
-            return combined.decode(encoding)
-        return combined
+        return bytes(buffer)
 
     async def readdir(self, path: str) -> List[str]:
         """List directory contents
