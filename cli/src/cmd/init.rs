@@ -307,7 +307,7 @@ mod tests {
 
         let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
-        let result = init_database(
+        let result = tokio::spawn(init_database(
             Some("force".to_string()),
             SyncCommandOptions {
                 sync_remote_url: None,
@@ -321,10 +321,10 @@ mod tests {
             None,
             None,
             MountBackend::default(),
-        )
+        ))
         .await;
         std::env::set_current_dir(previous).unwrap();
-        result.unwrap();
+        result.unwrap().unwrap();
 
         for name in others {
             assert!(agents.join(name).exists(), "{name} was deleted");

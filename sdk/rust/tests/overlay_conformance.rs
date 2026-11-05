@@ -42,9 +42,8 @@ fn field(s: &Stats, name: &str) -> String {
     }
 }
 
-/// `openMerged DB [BASE]`, or `reopen`. Without a base, the overlay uses the one in its database.
 async fn open_merged(fs: &mut Option<OverlayFS>, root: &Path, w: &[&str]) -> Result<String> {
-    let db = root.join(w.get(1).unwrap_or(&"db"));
+    let db = root.join(w[1]);
     let mut options = AgentFSOptions::with_path(db.to_str().unwrap());
     options.base = w.get(2).map(|b| root.join(b));
     let agent = AgentFS::open(options).await?;
@@ -57,7 +56,6 @@ async fn open_merged(fs: &mut Option<OverlayFS>, root: &Path, w: &[&str]) -> Res
     Ok(String::new())
 }
 
-/// Runs `statement` on a separate connection; rows come back as `a|b; c|d`.
 async fn sql(db: &Path, statement: &str) -> Result<String> {
     let conn = turso::Builder::new_local(db.to_str().unwrap())
         .build()
@@ -208,16 +206,13 @@ fn satisfied(want: Option<&str>, step_ok: bool, out: &str) -> bool {
 async fn run_steps(case: &Value, script: &str) -> std::result::Result<(), String> {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let base = root.join("base");
     let _ = ["base", "other", "dir"].map(|d| std::fs::create_dir(root.join(d)).unwrap());
-    std::env::set_current_dir(&base).unwrap();
+    std::env::set_current_dir(root.join("base")).unwrap();
     let setup = Command::new("sh").args(["-ec", script]).status().unwrap();
     assert!(setup.success(), "base setup failed");
-    let mut fs = None;
-    open_merged(&mut fs, root, &["openMerged", "db", "base"])
-        .await
-        .unwrap();
-    let (mut handle, mut vars) = (None, Vec::<(&str, String)>::new());
+    let (mut fs, mut handle, mut db) = (None, None, "db");
+    let (boot, mut vars) = (["openMerged", db, "base"], Vec::<(&str, String)>::new());
+    open_merged(&mut fs, root, &boot).await.unwrap();
     for step in case["steps"].as_array().unwrap() {
         let step = step.as_str().unwrap();
         let (cmd, want) = step
@@ -227,18 +222,24 @@ async fn run_steps(case: &Value, script: &str) -> std::result::Result<(), String
             .split_once(" = ")
             .filter(|(v, _)| v.chars().all(|c| c.is_alphanumeric() || c == '_'))
             .map_or((None, cmd), |(v, c)| (Some(v), c));
-        let words: Vec<&str> = cmd.split_whitespace().collect();
+        let mut words: Vec<&str> = cmd.split_whitespace().collect();
         if matches!(words[0], "close" | "reopen") {
             (handle, fs) = (None, None);
         }
+        if words[0] == "reopen" {
+            words = vec!["openMerged", db];
+        }
         let got = match words[0] {
             "close" => Ok(String::new()),
-            "openMerged" | "reopen" => open_merged(&mut fs, root, &words).await,
+            "openMerged" => open_merged(&mut fs, root, &words).await,
             op if op.starts_with("host") || ["sql", "legacyRust", "plainDb"].contains(&op) => {
                 run_aux(root, &words).await
             }
             _ => run_step(fs.as_ref().expect("overlay is closed"), &mut handle, &words).await,
         };
+        if got.is_ok() && words[0] == "openMerged" {
+            db = words[1];
+        }
         let out = got.as_ref().map_or_else(errno_name, |v| v.clone());
         let want = want.map(|w| {
             vars.iter()
