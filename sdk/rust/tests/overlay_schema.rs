@@ -226,36 +226,45 @@ async fn legacy_go_overlay_migrates_keeping_whiteouts() {
 
 #[tokio::test]
 async fn unknown_overlay_version_is_rejected_without_writes() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = make_base(dir.path());
-    let db = dir.path().join("o.db");
-    drop(AgentFS::open(opts(&db).with_base(&base)).await.unwrap());
+    let invalid_versions = [
+        vec!["UPDATE fs_overlay_config SET value = '2' WHERE key = 'version'"],
+        vec!["UPDATE fs_overlay_config SET value = X'31' WHERE key = 'version'"],
+        vec![
+            "UPDATE fs_overlay_config SET value = '2' WHERE key = 'version'",
+            "DELETE FROM fs_overlay_config WHERE key = 'base_path'",
+        ],
+    ];
+    for setup in invalid_versions {
+        let dir = tempfile::tempdir().unwrap();
+        let base = make_base(dir.path());
+        let db = dir.path().join("o.db");
+        drop(AgentFS::open(opts(&db).with_base(&base)).await.unwrap());
 
-    let conn = raw(&db).await;
-    conn.execute(
-        "UPDATE fs_overlay_config SET value = '2' WHERE key = 'version'",
-        (),
-    )
-    .await
-    .unwrap();
-    conn.execute("INSERT INTO fs_whiteout VALUES ('/f', 1)", ())
-        .await
-        .unwrap();
-    let snapshot = async |conn: &Connection| {
-        let mut all = Vec::new();
-        for table in ["fs_overlay_config", "fs_whiteout", "fs_origin"] {
-            all.push(rows(conn, &format!("SELECT * FROM {table} ORDER BY 1")).await);
+        let conn = raw(&db).await;
+        for sql in setup
+            .into_iter()
+            .chain(["INSERT INTO fs_whiteout VALUES ('/f', 1)"])
+        {
+            conn.execute(sql, ()).await.unwrap();
         }
-        all
-    };
-    let before = snapshot(&conn).await;
-    drop(conn);
+        let snapshot = async |conn: &Connection| {
+            let mut all = Vec::new();
+            for table in ["fs_overlay_config", "fs_whiteout", "fs_origin"] {
+                all.push(rows(conn, &format!("SELECT * FROM {table} ORDER BY 1")).await);
+            }
+            all
+        };
+        let before = snapshot(&conn).await;
+        drop(conn);
 
-    for options in [opts(&db), opts(&db).with_base(&base)] {
-        match AgentFS::open(options).await {
-            Err(Error::UnsupportedOverlayVersion(v)) => assert_eq!(v, "2"),
-            other => panic!("expected UnsupportedOverlayVersion, got {:?}", other.err()),
+        for options in [opts(&db), opts(&db).with_base(&base)] {
+            let result = AgentFS::open(options).await;
+            assert!(
+                matches!(result, Err(Error::UnsupportedOverlayVersion(_))),
+                "{:?}",
+                result.err()
+            );
         }
+        assert_eq!(snapshot(&raw(&db).await).await, before);
     }
-    assert_eq!(snapshot(&raw(&db).await).await, before);
 }

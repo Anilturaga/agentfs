@@ -99,6 +99,7 @@ impl OverlayFS {
     }
 
     /// Read a value of `fs_overlay_config`; `None` if the table or the key is absent.
+    /// A value that is not text is returned in its debug form, so it never equals a valid value.
     pub(crate) async fn config_value(conn: &Connection, key: &str) -> Result<Option<String>> {
         if !Self::has_column(conn, "fs_overlay_config", "key").await? {
             return Ok(None);
@@ -112,10 +113,20 @@ impl OverlayFS {
         Ok(match rows.next().await? {
             Some(row) => match row.get_value(0)? {
                 Value::Text(s) => Some(s),
-                _ => None,
+                other => Some(format!("{other:?}")),
             },
             None => None,
         })
+    }
+
+    /// `true` if the overlay is at format v1, `false` if it has no version.
+    /// Any other version is an error.
+    pub(crate) async fn check_version(conn: &Connection) -> Result<bool> {
+        match Self::config_value(conn, "version").await? {
+            Some(v) if v == OVERLAY_VERSION => Ok(true),
+            Some(v) => Err(Error::UnsupportedOverlayVersion(v)),
+            None => Ok(false),
+        }
     }
 
     async fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -128,10 +139,8 @@ impl OverlayFS {
     /// A database without a version is initialized or migrated in one transaction.
     /// A database with an unknown version fails without being written.
     pub async fn init_schema(conn: &Connection, base_path: &str) -> Result<()> {
-        match Self::config_value(conn, "version").await? {
-            Some(v) if v == OVERLAY_VERSION => return Ok(()),
-            Some(v) => return Err(Error::UnsupportedOverlayVersion(v)),
-            None => {}
+        if Self::check_version(conn).await? {
+            return Ok(());
         }
         let base = std::fs::metadata(base_path)?;
         let identity = format!("host:{}:{}", base.dev(), base.ino());

@@ -355,6 +355,9 @@ impl AgentFS {
         let conn = pool.get_connection().await?;
         schema::check_schema_version(&conn).await?;
 
+        // An overlay with an unsupported version is never opened, whatever its base
+        OverlayFS::check_version(&conn).await?;
+
         // Open the overlay schema at v1 (migrating legacy databases) for the given
         // base, or for the base recorded in an existing overlay database
         let base_path = match options.base {
