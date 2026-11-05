@@ -288,8 +288,8 @@ mod tests {
     #[tokio::test]
     async fn force_init_removes_only_target_agent_files() {
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        std::fs::create_dir(".agentfs").unwrap();
+        let agents = dir.path().join(".agentfs");
+        std::fs::create_dir(&agents).unwrap();
 
         let target = [
             "force.db",
@@ -302,10 +302,12 @@ mod tests {
         ];
         let others = ["force-victim.db", "force-victim.db-wal", "force.dbx"];
         for name in target.iter().chain(&others) {
-            std::fs::write(agentfs_dir().join(name), "stale").unwrap();
+            std::fs::write(agents.join(name), "stale").unwrap();
         }
 
-        init_database(
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let result = tokio::spawn(init_database(
             Some("force".to_string()),
             SyncCommandOptions {
                 sync_remote_url: None,
@@ -319,22 +321,20 @@ mod tests {
             None,
             None,
             MountBackend::default(),
-        )
-        .await
-        .unwrap();
+        ))
+        .await;
+        std::env::set_current_dir(previous).unwrap();
+        result.unwrap().unwrap();
 
         for name in others {
-            assert!(agentfs_dir().join(name).exists(), "{name} was deleted");
+            assert!(agents.join(name).exists(), "{name} was deleted");
         }
         for name in &target[1..] {
             assert!(
-                std::fs::read(agentfs_dir().join(name)).map_or(true, |c| c != b"stale"),
+                std::fs::read(agents.join(name)).map_or(true, |c| c != b"stale"),
                 "{name} was not removed"
             );
         }
-        assert_ne!(
-            std::fs::read(agentfs_dir().join("force.db")).unwrap(),
-            b"stale"
-        );
+        assert_ne!(std::fs::read(agents.join("force.db")).unwrap(), b"stale");
     }
 }

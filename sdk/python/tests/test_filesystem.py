@@ -513,7 +513,6 @@ class TestFilesystemChunkSize:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             db = await connect(db_path)
-            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
             fs = await Filesystem.from_database(db)
             chunk_size = fs.get_chunk_size()
 
