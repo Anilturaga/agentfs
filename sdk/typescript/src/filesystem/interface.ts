@@ -54,6 +54,26 @@ export function createStats(data: StatsData): Stats {
 }
 
 /**
+ * Copy the bytes of each chunk (chunk `i` starts at `i * chunkSize`) that overlap
+ * `[offset, offset + out.length)` into `out`. Bytes not covered by a chunk are left as-is.
+ */
+export function fillFromChunks(
+  out: Uint8Array,
+  offset: number,
+  chunkSize: number,
+  rows: { chunk_index: number; data: Uint8Array }[]
+): void {
+  for (const { chunk_index, data } of rows) {
+    const chunkStart = chunk_index * chunkSize;
+    const from = Math.max(offset - chunkStart, 0);
+    const to = Math.min(chunkSize, data.length, offset + out.length - chunkStart);
+    if (from < to) {
+      out.set(data.subarray(from, to), chunkStart + from - offset);
+    }
+  }
+}
+
+/**
  * Directory entry with full statistics
  */
 export interface DirEntry {

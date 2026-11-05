@@ -147,6 +147,42 @@ describe("Filesystem Integration Tests", () => {
       expected[cs * 2 + 1] = 8;
       expect(data.equals(expected)).toBe(true);
     });
+
+    it("should clip an oversized chunk to the chunk size", async () => {
+      const cs = fs.getChunkSize();
+      await insertSparseFile("long.bin", cs + 2, { 0: Array(cs + 2).fill(1), 1: [2] });
+      const data = (await fs.readFile("/long.bin")) as Buffer;
+      expect(data[cs - 1]).toBe(1);
+      expect(data[cs]).toBe(2);
+      expect(data[cs + 1]).toBe(0);
+    });
+
+    it("should place pread bytes by offset and honor the stored size", async () => {
+      const cs = fs.getChunkSize();
+      await insertSparseFile("tail.bin", 10, { 0: [120] });
+      await insertSparseFile("holes.bin", cs * 3 + 2, { 0: [1, 2], 2: [7, 8] });
+      const tail = await fs.open("/tail.bin");
+      const holes = await fs.open("/holes.bin");
+
+      expect([...(await tail.pread(0, 10))]).toEqual([120, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+      expect([...(await tail.pread(8, 100))]).toEqual([0, 0]);
+      expect((await tail.pread(10, 5)).length).toBe(0);
+      expect((await tail.pread(50, 5)).length).toBe(0);
+
+      // Starts in chunk 0, crosses the missing chunk 1, ends in chunk 2.
+      const crossing = await holes.pread(cs - 1, cs + 3);
+      expect(crossing.length).toBe(cs + 3);
+      expect(crossing.subarray(0, cs + 1).every((b) => b === 0)).toBe(true);
+      expect([...crossing.subarray(cs + 1)]).toEqual([7, 8]);
+      expect([...(await holes.pread(0, 3))]).toEqual([1, 2, 0]);
+    });
+
+    it("should read zeros for the tail a truncate extends", async () => {
+      await fs.writeFile("/ext.bin", "x");
+      const handle = await fs.open("/ext.bin");
+      await handle.truncate(10);
+      expect([...(await handle.pread(0, 10))]).toEqual([120, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    });
   });
 
   describe("Directory Operations", () => {

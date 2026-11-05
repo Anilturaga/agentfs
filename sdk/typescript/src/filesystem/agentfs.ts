@@ -20,6 +20,7 @@ import {
   DEFAULT_FILE_MODE,
   DEFAULT_DIR_MODE,
   createStats,
+  fillFromChunks,
   type Stats,
   type DirEntry,
   type FilesystemStats,
@@ -46,36 +47,26 @@ class AgentFSFile implements FileHandle {
   }
 
   async pread(offset: number, size: number): Promise<Buffer> {
-    const startChunk = Math.floor(offset / this.chunkSize);
-    const endChunk = Math.floor((offset + size - 1) / this.chunkSize);
+    const sizeStmt = this.db.prepare('SELECT size FROM fs_inode WHERE ino = ?');
+    const sizeRow = await sizeStmt.get(this.ino) as { size: number } | undefined;
+    const length = Math.max(0, Math.min(size, (sizeRow?.size ?? 0) - offset));
+    const out = this.bufferCtor.alloc(length);
+    if (length === 0) {
+      return out;
+    }
 
     const stmt = this.db.prepare(`
       SELECT chunk_index, data FROM fs_data
       WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ?
-      ORDER BY chunk_index ASC
     `);
-    const rows = await stmt.all(this.ino, startChunk, endChunk) as { chunk_index: number; data: Buffer }[];
+    const rows = await stmt.all(
+      this.ino,
+      Math.floor(offset / this.chunkSize),
+      Math.floor((offset + length - 1) / this.chunkSize)
+    ) as { chunk_index: number; data: Buffer }[];
 
-    const buffers: Buffer[] = [];
-    let bytesCollected = 0;
-    const startOffsetInChunk = offset % this.chunkSize;
-
-    for (const row of rows) {
-      const skip = buffers.length === 0 ? startOffsetInChunk : 0;
-      if (skip >= row.data.length) {
-        continue;
-      }
-      const remaining = size - bytesCollected;
-      const take = Math.min(row.data.length - skip, remaining);
-      buffers.push(row.data.subarray(skip, skip + take));
-      bytesCollected += take;
-    }
-
-    if (buffers.length === 0) {
-      return this.bufferCtor.alloc(0);
-    }
-
-    return this.bufferCtor.concat(buffers);
+    fillFromChunks(out, offset, this.chunkSize, rows);
+    return out;
   }
 
   async pwrite(offset: number, data: Buffer): Promise<void> {
@@ -555,12 +546,7 @@ export class AgentFS implements FileSystem {
 
     // Chunks may be short or missing (holes); bytes not covered by a chunk stay zero.
     const combined = this.bufferCtor.alloc(size);
-    for (const row of rows) {
-      const start = row.chunk_index * this.chunkSize;
-      if (start < size) {
-        combined.set(row.data.subarray(0, size - start), start);
-      }
-    }
+    fillFromChunks(combined, 0, this.chunkSize, rows);
 
     const now = Math.floor(Date.now() / 1000);
     const updateStmt = this.db.prepare('UPDATE fs_inode SET atime = ? WHERE ino = ?');
