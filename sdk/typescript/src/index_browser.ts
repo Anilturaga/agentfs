@@ -4,6 +4,7 @@ import { KvStore } from "./kvstore.js";
 import { AgentFS as AgentFSImpl } from "./filesystem/index.js";
 import { ToolCalls } from "./toolcalls.js";
 import { Buffer } from "buffer";
+import { createOverlay as create, openMerged as open, type LowerAdapter } from "./overlay/overlayfs.js";
 
 export class AgentFS extends AgentFSCore {
     static async openWith(db: DatabasePromise): Promise<AgentFSCore> {
@@ -22,3 +23,8 @@ export { AgentFS as Filesystem } from './filesystem/index.js';
 export type { Stats, DirEntry, FilesystemStats, FileHandle, FileSystem } from './filesystem/index.js';
 export { ToolCalls } from './toolcalls.js';
 export type { ToolCall, ToolCallStats } from './toolcalls.js';
+
+export { OverlayFS } from './overlay/overlayfs.js';
+export type { Change, LowerAdapter, LowerStats, OverlayInfo } from './overlay/overlayfs.js';
+export const createOverlay = (db: DatabasePromise, base: LowerAdapter) => create(db, base, Buffer);
+export const openMerged = (db: DatabasePromise, base: LowerAdapter) => open(db, base, Buffer);

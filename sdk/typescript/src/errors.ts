@@ -9,7 +9,12 @@ export type FsErrorCode =
   | 'ENOTEMPTY' // Directory not empty
   | 'EPERM'     // Operation not permitted
   | 'EINVAL'    // Invalid argument
-  | 'ENOSYS';   // Function not implemented (use for symlinks)
+  | 'ENOSYS'    // Function not implemented (use for symlinks)
+  | 'EBUSY'     // Overlay database is already open
+  | 'EXDEV'     // Hard link across layers
+  | 'ENOTSUP'   // Unsupported overlay format, special file, or lockless storage
+  | 'ESTALE'    // Base does not match the overlay's recorded identity
+  | 'ELOOP';    // Too many symbolic links
 
 /**
  * Filesystem syscall names for error reporting.
@@ -25,7 +30,9 @@ export type FsSyscall =
   | 'rename'
   | 'scandir'
   | 'copyfile'
-  | 'access';
+  | 'access'
+  | 'chmod'
+  | 'link';
 
 export interface ErrnoException extends Error {
   code?: FsErrorCode;

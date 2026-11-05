@@ -10,6 +10,7 @@
     "build": "tsc",
     "watch": "tsc --watch",
     "test": "vitest run",
+    "test:conformance": "vitest run tests/overlay-conformance.test.ts",
     "test:browser": "CI=1 vitest -c vitest.browser.config.ts --browser=chromium --run && CI=1 vitest -c vitest.browser.config.ts --browser=firefox --run",
     "test:watch": "vitest watch",
     "test:ui": "vitest --ui",

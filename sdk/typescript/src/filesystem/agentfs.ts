@@ -32,8 +32,9 @@ const DEFAULT_CHUNK_SIZE = 4096;
 
 /**
  * An open file handle for AgentFS.
+ * @internal
  */
-class AgentFSFile implements FileHandle {
+export class AgentFSFile implements FileHandle {
   private db: DatabasePromise;
   private bufferCtor: BufferConstructor;
   private ino: number;
@@ -393,7 +394,8 @@ export class AgentFS implements FileSystem {
     return { parentIno, name };
   }
 
-  private async createInode(mode: number, uid: number = 0, gid: number = 0): Promise<number> {
+  /** @internal */
+  async createInode(mode: number, uid: number = 0, gid: number = 0): Promise<number> {
     const now = Math.floor(Date.now() / 1000);
     const stmt = this.db.prepare(`
       INSERT INTO fs_inode (mode, uid, gid, size, atime, mtime, ctime)
@@ -404,7 +406,8 @@ export class AgentFS implements FileSystem {
     return Number(ino);
   }
 
-  private async createDentry(parentIno: number, name: string, ino: number): Promise<void> {
+  /** @internal */
+  async createDentry(parentIno: number, name: string, ino: number): Promise<void> {
     const stmt = this.db.prepare(`
       INSERT INTO fs_dentry (name, parent_ino, ino)
       VALUES (?, ?, ?)
@@ -831,7 +834,8 @@ export class AgentFS implements FileSystem {
     }
   }
 
-  private async removeDentryAndMaybeInode(parentIno: number, name: string, ino: number): Promise<void> {
+  /** @internal */
+  async removeDentryAndMaybeInode(parentIno: number, name: string, ino: number): Promise<void> {
     const stmt = this.db.prepare(`
       DELETE FROM fs_dentry
       WHERE parent_ino = ? AND name = ?
