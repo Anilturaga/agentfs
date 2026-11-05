@@ -69,6 +69,10 @@ pub enum Error {
     #[error("{0}")]
     Internal(String),
 
+    /// The overlay database has a format version this SDK cannot open (ENOTSUP)
+    #[error("unsupported overlay format version '{0}': this SDK supports version 1")]
+    UnsupportedOverlayVersion(String),
+
     /// Schema version mismatch - database schema version doesn't match expected version
     #[error("schema version mismatch: database is version {found}, expected {expected}")]
     SchemaVersionMismatch { found: String, expected: String },
