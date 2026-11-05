@@ -497,3 +497,16 @@ async def test_handle_after_ancestor_replaced_by_file_is_enoent(overlay, base):
         assert await code(handle.pwrite(0, b"z")) == "ENOENT"
         assert await code(handle.truncate(0)) == "ENOENT"
         assert await fs.read_file("/d") == "file"
+
+
+async def test_handle_on_unlinked_delta_file_is_enoent(overlay, base):
+    async with await open_merged(overlay, base) as fs:
+        await fs.write_file("/n", "abc")
+        handle = await fs.open("/n")
+        await fs.link("/n", "/m")
+        await fs.unlink("/n")
+        await handle.pwrite(0, b"X")
+        assert await fs.read_file("/m") == "Xbc"
+        await fs.unlink("/m")
+        for attempt in (handle.pwrite(0, b"z"), handle.truncate(0), handle.pread(0, 1)):
+            assert await code(attempt) == "ENOENT"

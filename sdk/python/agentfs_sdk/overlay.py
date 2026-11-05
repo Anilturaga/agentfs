@@ -255,6 +255,7 @@ class OverlayFS:
     async def _pread(self, node: _Node, offset: int, size: int) -> bytes:
         if (delta := self._delta_ino(node)) is None:
             return await self._lower.read(node.path, offset, size)
+        await self._stats(node.ino, delta, node.path)
         return (await self._delta._read_inode(delta))[offset : offset + size]
 
     async def _child(self, parent: _Node, name: str) -> _Node | None:
@@ -466,6 +467,7 @@ class OverlayFS:
                 if found is None or found.ino != node.ino:
                     _fail("ENOENT", "open", node.path)
                 ino = await self._copy_up(found, keep_tail or offset > 0)
+            await self._stats(node.ino, ino, node.path)
             if keep_tail and not data:
                 return
             old = await self._delta._read_inode(ino)
