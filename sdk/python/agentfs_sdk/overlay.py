@@ -1,10 +1,12 @@
 """Overlay filesystem: a writable AgentFS delta over a read-only base."""
 
 import asyncio
+import contextlib
 import functools
 import gc
 import itertools
 import os
+import stat
 import sys
 import time
 import traceback
@@ -31,6 +33,7 @@ _SCHEMA = (
 _LEGACY = (
     "legacy overlay database: open it once with the agentfs CLI or Rust SDK to upgrade to format v1"
 )
+_SIDECARS = ("-wal", "-shm", "-log", "-wal-revert", "-info", "-changes")
 _held: set[tuple[int, int]] = set()
 
 
@@ -166,13 +169,17 @@ class _Lock:
     db: Connection | None = None
     key: tuple[int, int] | None = None
 
-    async def take(self, path: str) -> None:
+    async def take(self, path: str, syscall: FsSyscall, create: bool = False) -> None:
         if os.path.exists(path):
             st = os.stat(path)
             if (st.st_dev, st.st_ino) in _held:
-                _fail("EBUSY", "open", path)
+                _fail("EBUSY", syscall, path)
+            if st.st_nlink > 1:
+                _fail("ENOTSUP", syscall, path)
             self.key = (st.st_dev, st.st_ino)
             _held.add(self.key)
+        elif not create:
+            _fail("ENOENT", syscall, path)
         try:
             self.db = await connect(path)
         except turso.DatabaseError as e:
@@ -684,7 +691,7 @@ async def create_overlay(db_path: DbPath, base: Base) -> OverlayInfo:
     identity = await lower.identity()
     lock = _Lock()
     try:
-        await lock.take(path)
+        await lock.take(path, "create_overlay", create=True)
         await AgentFS.open_with(lock.db)
         await _init_v1(lock.db, lower, identity)
     finally:
@@ -695,12 +702,83 @@ async def create_overlay(db_path: DbPath, base: Base) -> OverlayInfo:
 async def open_merged(db_path: DbPath, base: Base | None = None) -> OverlayFS:
     """Opens the overlay in `db_path` and holds its writer lock until `close()`."""
     path = os.fspath(db_path)
-    if not os.path.exists(path):
-        _fail("ENOENT", "open_merged", path)
     lock = _Lock()
     try:
-        await lock.take(path)
+        await lock.take(path, "open_merged")
         return await _mount(lock, path, base)
     except BaseException:
         await lock.release()
         raise
+
+
+async def _config(db: Connection) -> dict[str, str] | None:
+    """The `fs_overlay_config` rows, or None without that table."""
+    if await _q(db, "SELECT 1 FROM sqlite_master WHERE name = 'fs_overlay_config'"):
+        return dict(await _q(db, "SELECT key, value FROM fs_overlay_config"))
+
+
+async def list_overlays(dir: DbPath, base: Base | None = None) -> list[OverlayInfo]:
+    """The overlay databases directly in `dir`, sorted by path; with `base`, only those over it.
+
+    A file that cannot be read, or that another process holds open, is left out.
+    """
+    lower = _lower(base) if base is not None else None
+    identity = await lower.identity() if lower else None
+    found = []
+    for name in sorted(os.listdir(dir)):
+        path = os.path.join(dir, name)
+        st = os.lstat(path)
+        if not (name.endswith(".db") and stat.S_ISREG(st.st_mode)) or st.st_nlink > 1:
+            continue
+        lock = _Lock()
+        try:
+            lock.db = await connect(path)
+            config = await _config(lock.db)
+            info = OverlayInfo(
+                path,
+                int(config.get("version", 0)),
+                config["base_path"],
+                config.get("base_identity", ""),
+            )
+        except Exception:
+            continue
+        finally:
+            await lock.release()
+        legacy = not info.base_identity and lower and info.base_path == lower.locator
+        if lower is None or info.base_identity == identity or legacy:
+            found.append(info)
+    return found
+
+
+async def delete_overlay(db_path: DbPath) -> None:
+    """Deletes the overlay database and its sidecars, holding its lock until the last is gone."""
+    path = os.fspath(db_path)
+    lock = _Lock()
+    try:
+        await lock.take(path, "delete_overlay")
+        if await _config(lock.db) is None:
+            _fail("EINVAL", "delete_overlay", path)
+        for suffix in (*_SIDECARS, ""):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path + suffix)
+    finally:
+        await lock.release()
+
+
+async def rebind_overlay(db_path: DbPath, base: Base) -> None:
+    """Records `base` as the base of the v1 overlay in `db_path`."""
+    path, lower = os.fspath(db_path), _lower(base)
+    rows = [("base_path", lower.locator), ("base_identity", await lower.identity())]
+    lock = _Lock()
+    try:
+        await lock.take(path, "rebind_overlay")
+        version = (await _config(lock.db) or {}).get("version")
+        if version is None:
+            _fail("EINVAL", "rebind_overlay", path)
+        if version != "1":
+            _fail("ENOTSUP", "rebind_overlay", path)
+        sql = "INSERT OR REPLACE INTO fs_overlay_config (key, value) VALUES (?, ?)"
+        await lock.db.executemany(sql, rows)
+        await lock.db.commit()
+    finally:
+        await lock.release()
