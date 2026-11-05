@@ -486,132 +486,287 @@ Such extensions SHOULD use separate tables to maintain referential integrity.
 
 ## Overlay Filesystem
 
-The overlay filesystem provides copy-on-write semantics by layering a writable delta filesystem on top of a read-only base filesystem. Changes are written to the delta layer while the base layer remains unmodified. This enables sandboxed execution where modifications can be discarded or committed independently.
+The overlay filesystem puts a writable **delta** (an AgentFS database) over a read-only **base** (the lower layer). All changes go to the delta. The overlay never writes to the base. This section defines **overlay format version 1** (v1). Every SDK that implements overlays MUST implement v1.
 
-### Whiteouts
+### Terms
 
-When a file is deleted from an overlay filesystem, the deletion must be recorded so that lookups do not fall through to the base layer. This is accomplished using "whiteouts" - markers that indicate a path has been explicitly deleted.
+- **Path**: an absolute, `/`-separated path with no empty, `.` or `..` components and no trailing `/`. The root is `/`. Paths compare as byte strings.
+- **parent(P)**: P without its last component.
+- **The lower resolves P**: every proper ancestor of P is a directory in the base, and the base has an entry at P. The base is read one component at a time and never follows symlinks.
+- **P is delta-backed**: the delta has an entry at P, resolved through `fs_dentry` from inode 1.
+- **P is covered**: `fs_whiteout` has a row for P or for a proper ancestor of P.
+- **Merged entry**: an entry of the merged view. It is delta-backed or lower-backed.
+
+### Schema
+
+#### Table: `fs_overlay_config`
+
+```sql
+CREATE TABLE fs_overlay_config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+)
+```
+
+| Key | Value |
+|-----|-------|
+| `version` | Overlay format version: `1` |
+| `base_path` | Base locator. Host directory: its canonical absolute path. Other lower adapters: an adapter-defined string. |
+| `base_identity` | Base identity at initialization (see Lower Layer) |
+
+Initialization writes the three keys in one transaction. After that, only migration changes these rows.
 
 #### Table: `fs_whiteout`
-
-Tracks deleted paths in the overlay to prevent base layer visibility.
 
 ```sql
 CREATE TABLE fs_whiteout (
   path TEXT PRIMARY KEY,
-  parent_path TEXT NOT NULL,
   created_at INTEGER NOT NULL
 )
-
-CREATE INDEX idx_fs_whiteout_parent ON fs_whiteout(parent_path)
 ```
 
-**Fields:**
-
-- `path` - Normalized absolute path that has been deleted
-- `parent_path` - Parent directory path (for efficient child lookups)
-- `created_at` - Deletion timestamp (Unix timestamp, seconds)
-
-**Notes:**
-
-- The `parent_path` column enables O(1) lookups of whiteouts within a directory, avoiding expensive `LIKE` pattern matching
-- For the root directory `/`, `parent_path` is `/`
-- For other paths, `parent_path` is the path with the final component removed (e.g., `/foo/bar` has parent `/foo`)
-
-### Operations
-
-#### Create Whiteout
-
-When deleting a file that exists in the base layer:
-
-```sql
-INSERT INTO fs_whiteout (path, parent_path, created_at)
-VALUES (?, ?, ?)
-ON CONFLICT(path) DO UPDATE SET created_at = excluded.created_at
-```
-
-#### Check for Whiteout
-
-Before falling through to the base layer during lookup:
-
-```sql
-SELECT 1 FROM fs_whiteout WHERE path = ?
-```
-
-#### Remove Whiteout
-
-When creating a file at a previously deleted path:
-
-```sql
-DELETE FROM fs_whiteout WHERE path = ?
-```
-
-#### List Child Whiteouts
-
-When listing a directory, get whiteouts to exclude from base layer results:
-
-```sql
-SELECT path FROM fs_whiteout WHERE parent_path = ?
-```
-
-### Overlay Lookup Semantics
-
-1. Check if path exists in delta layer → return delta entry
-2. Check if path has a whiteout → return "not found"
-3. Check if path exists in base layer → return base entry
-4. Return "not found"
-
-### Inode Origin Tracking
-
-When a file is copied from the base layer to the delta layer during a copy-up operation (e.g., when creating a hard link to a base file), the original base inode number must be preserved. This is necessary because the kernel caches inode numbers, and returning a different inode after copy-up causes ENOENT errors or cache inconsistencies.
-
-This mechanism is similar to Linux overlayfs's `trusted.overlay.origin` extended attribute, which stores a file handle to the lower inode.
+- `path` - Path whose base entry, and the base subtree below it, is hidden. Never `/`.
+- `created_at` - Insertion time (Unix timestamp, seconds)
+- A whiteout hides base entries only. It never hides a delta entry.
+- v1 never deletes a whiteout. A whiteout at a delta-backed directory makes that directory opaque: its base children stay hidden.
 
 #### Table: `fs_origin`
-
-Maps delta layer inodes to their original base layer inodes.
 
 ```sql
 CREATE TABLE fs_origin (
   delta_ino INTEGER PRIMARY KEY,
-  base_ino INTEGER NOT NULL
+  lower_path TEXT NOT NULL
 )
 ```
 
-**Fields:**
+- `delta_ino` - Delta inode that a copy-up created
+- `lower_path` - Path of the copied base entry at copy-up time. It always names an entry of this overlay's base layer, the only lower layer in v1.
+- Origins record provenance only. Lookup, stat, readdir and diff MUST NOT read `fs_origin`.
 
-- `delta_ino` - Inode number in the delta layer
-- `base_ino` - Original inode number from the base layer
+### Lower Layer
 
-#### Operations
+An SDK reads the base through a read-only lower adapter. The adapter provides:
 
-##### Store Origin Mapping
+- `identity()` - a non-empty string that identifies the base
+- `lstat(path)` - stats, or "not found"; it never follows symlinks at any component
+- `readdir(path)` - entry names
+- `readlink(path)` - symlink target
+- `read(path, offset, length)` - bytes of a regular file
 
-When copying a file from base to delta during copy-up:
+The **host adapter** serves a host directory. Its locator is the canonical absolute path of the directory. Its identity is `host:` followed by the decimal `st_ino` of that directory, for example `host:1234567`. Browser and Cloudflare targets inject their own adapter.
 
-```sql
-INSERT OR REPLACE INTO fs_origin (delta_ino, base_ino)
-VALUES (?, ?)
+The base MUST NOT change while an overlay over it is open. v1 does not detect changes inside the base.
+
+### Lookup Precedence
+
+The merged entry at P (P is not `/`) can exist only if the merged entry at parent(P) is a directory. Then:
+
+1. If P is delta-backed, return the delta entry.
+2. Else, if P is covered, return "not found".
+3. Else, if the lower resolves P, return the base entry.
+4. Else, return "not found".
+
+The merged root is the delta root.
+
+### Reads and Handles
+
+- `stat`, `lstat`, `readlink`, `open`, `read`, `readdir` and `access` MUST NOT write to the delta for a lower-backed entry.
+- `readdir(P)` returns the name of each merged entry whose parent is P, once, sorted by byte order, without `.` and `..`.
+- `readdir-plus(P)` returns, for each name, the same stats as `lstat` of that path.
+- A handle refers to the merged entry, not to a layer. After a copy-up of the entry, every handle of the entry reads and writes the delta copy, including handles opened before the copy-up.
+
+### Copy-Up
+
+Copy-up of the lower-backed entry at P:
+
+1. Copy up each lower-backed proper ancestor of P, top-down.
+2. Create the delta entry at P with the same type, permission bits, uid and gid. A regular file gets its full content. A symlink gets the same target. A directory gets no children; its base children stay visible through lookup.
+3. Insert `(delta_ino, P)` into `fs_origin`.
+
+- Copy-up does not create or delete whiteouts, and does not change the merged `ino`.
+- Copy-up of a special file (FIFO, character device, block device, socket) fails with `ENOTSUP`.
+- v1 does not specify timestamps after copy-up.
+- If the change that causes the copy-up truncates the file to 0 bytes, copy-up MAY skip the content.
+
+These changes copy up a lower-backed entry first: a write or truncate through any handle, `chmod`, `chown`, `utimens`, and `rename`. Creating an entry in a lower-backed directory copies up that directory. `open` never copies up, whatever its flags; an open that truncates is a truncate.
+
+### Mutations
+
+Each mutation applies the POSIX error rules to the merged view (for example `ENOENT`, `EEXIST`, `EISDIR`, `ENOTDIR`, `ENOTEMPTY`). **Hide(P)** means: if the lower resolves P and P is not covered, insert a whiteout for P.
+
+- **Create** (file, directory, symlink, special file) at P: copy up parent(P) if it is lower-backed, then create the entry in the delta. A whiteout at P stays, so a new directory at P is empty.
+- **unlink(P)**, **rmdir(P)**: delete the delta entry at P, if there is one. Then Hide(P). Whiteouts below P stay.
+- **link(S, D)**: if S is lower-backed, fail with `EXDEV`. Else copy up parent(D) if it is lower-backed, then link in the delta.
+- **rename(S, D)**:
+  1. If S does not exist, fail with `ENOENT`.
+  2. If S and D are the same path, or the same delta inode, return success and change nothing.
+  3. If D is below S, fail with `EINVAL`. Apply the POSIX rules for an existing D.
+  4. Copy up S. If S is a directory, copy up each lower-backed entry of its merged subtree, top-down. Check the full subtree first: if it contains a lower special file, fail with `ENOTSUP` and change nothing.
+  5. Copy up parent(D) if it is lower-backed. Delete the delta entry at D, if there is one.
+  6. Move the delta entry from S to D. Moved entries keep their origins.
+  7. Hide(S). Hide(D). Hide(D) makes a moved directory opaque over a replaced base directory.
+
+SDK convenience operations (for example `writeFile`, `rm`, `copyFile`) behave as their decomposition into these operations.
+
+### Symlink Resolution
+
+SDK path resolution walks the merged view one component at a time.
+
+- A symlink at an intermediate component is always followed. Which operations follow a symlink at the final component is as in the base filesystem.
+- The target comes from the merged entry. A relative target resolves from the directory that contains the symlink. An absolute target resolves from the merged root, never from the host root.
+- `..` goes to the merged parent. At the root, `..` stays at the root.
+- A resolution that follows more than 40 symlinks fails with `ELOOP`.
+- A kernel mount (FUSE, NFS) resolves symlinks itself. These rules apply to SDK path APIs.
+
+### Stat Identity
+
+- The stats of a merged entry come from its backing layer: the delta entry if it is delta-backed, else the base entry.
+- The open instance gives each merged entry an `ino`. The root has `ino` 1.
+- In one instance, an entry keeps its `ino` through `lookup`, `stat`, `lstat`, `readdir-plus`, `fstat`, copy-up and rename. Distinct entries have distinct values, except delta hard links of one delta inode, which share one. An instance never reuses an `ino`.
+- An entry starts at its first lookup. It ends when it is removed or replaced.
+- After close and reopen, `ino` values MAY differ. The type, permission bits, uid, gid, size, nlink and mtime of each entry MUST NOT change.
+
+### Writer Policy
+
+- One instance at a time opens an overlay database. v1 has no separate reader mode.
+- The instance holds an exclusive lock on the database from open to close. A second open, from any process or from the same process, fails with `EBUSY`.
+- For a local database file, the engine's exclusive file lock (turso takes it on each read-write open) enforces the rule across processes. The SDK MUST also refuse a second open of the same file in its own process.
+- Storage that serializes access by construction (for example a Cloudflare Durable Object) satisfies the rule.
+- An overlay on storage that allows concurrent clients without a lock (for example a remote serverless database) fails to open with `ENOTSUP`.
+- `listOverlays` reads `fs_overlay_config` without the lock. `deleteOverlay` takes the lock first.
+
+### Versioning and Migration
+
+`openMerged` classifies the database before any other access:
+
+| Database state | Action |
+|----------------|--------|
+| `version` is `1` | Open as v1. |
+| `version` has another value | Fail with `ENOTSUP`. Do not write. |
+| `fs_overlay_config` exists and has no `version` (legacy Rust) | Migrate. |
+| No `fs_overlay_config`, base given (plain AgentFS or legacy Go) | Initialize v1, migrating legacy Go tables. |
+| No `fs_overlay_config`, no base given | Fail with `EINVAL`. |
+
+Migration runs in one transaction. A failed migration leaves the database unchanged.
+
+1. `fs_whiteout`: create it if absent. If it has a `parent_path` column (legacy Go), rebuild it as v1 and keep every row. Drop `idx_fs_whiteout_parent`.
+2. `fs_origin`: create it if absent. If it has a `base_ino` column, rebuild it as v1. Set `lower_path` to the delta path of `delta_ino` (from its dentry with the lowest `id`). Drop rows whose `delta_ino` has no dentry.
+3. `fs_overlay_config`: create it if absent. Write `base_path` and `base_identity` from the base that is being opened. Write `version` = `1` last.
+
+The AgentFS schema version (`0.4`) is independent of the overlay format version.
+
+### Management Operations
+
+Every SDK exposes these operations in its own naming style. `base` is a host directory path or a lower adapter.
+
+- `createOverlay(dbPath, base) → OverlayInfo` - Create a database at `dbPath` with the AgentFS schema and an initialized v1 overlay. If `dbPath` exists, fail with `EEXIST`. If a host base does not exist, fail with `ENOENT`.
+- `openMerged(dbPath, base?) → MergedFS` - If `dbPath` does not exist, fail with `ENOENT`. Take the lock (Writer Policy). Classify the database (Versioning and Migration). Without `base`, use the host adapter at `base_path`: fail with `EINVAL` if there is no `base_path`, and with `ENOENT` if the directory does not exist. For a v1 database, if the base identity is not `base_identity`, fail with `ESTALE`. Where storage has no path, `dbPath` is an SDK-native database handle.
+- `MergedFS` - The SDK's filesystem interface with the semantics of this section, plus `diff()` and `close()`. `close()` releases the lock.
+- `MergedFS.diff() → Change[]` - See Diff.
+- `listOverlays(dir, base?) → OverlayInfo[]` - Read each regular file named `*.db` directly in `dir` that has `fs_overlay_config`. Skip files that cannot be read (for example encrypted databases). With `base`, keep only overlays whose `base_identity` is the identity of `base` (legacy: whose `base_path` is its canonical path). Sort by path.
+- `deleteOverlay(dbPath)` - If `dbPath` does not exist, fail with `ENOENT`. Take the lock. If the database has no `fs_overlay_config`, fail with `EINVAL`. Delete `dbPath` and its engine sidecar files (`-wal`, `-shm`, `-info`).
+- `OverlayInfo` - `{ path, version, basePath, baseIdentity }`. A legacy overlay has `version` 0 and an empty `baseIdentity`.
+- `Change` - `{ change: A | M | D, type: f | d | l | ?, path }`.
+
+### Diff
+
+`diff()` compares the merged tree with the base tree. It does not write to the delta.
+
+- L is the set of base paths and M is the set of merged paths, both without `/`. Both walks enter directories only and never follow symlinks.
+- `A`: P is in M and not in L. `M`: P is in L and in M, and P is delta-backed. `D`: P is in L and not in M.
+- The type is `f` (regular file), `d` (directory), `l` (symlink) or `?` (other). `A` and `M` use the merged entry. `D` uses the base entry.
+- Changes are sorted by path in byte order. The text form is one line per change, `<change> <type> <path>`, for example `M f /src/main.rs`.
+- A full walk of the base is not necessary: `A` and `M` come from the delta paths, and `D` comes from the base subtrees of the whiteouts.
+
+### Unsupported in v1
+
+| Operation | Required error |
+|-----------|----------------|
+| A second open of an open overlay database | `EBUSY` |
+| `link` with a lower-backed source (hard link across layers) | `EXDEV` |
+| Copy-up or `open` of a lower special file | `ENOTSUP` |
+| An overlay format version other than 1 | `ENOTSUP` |
+| An overlay on storage that allows concurrent clients without a lock | `ENOTSUP` |
+| A base whose identity is not `base_identity` | `ESTALE` |
+
+- SDKs report each error with its POSIX name (TypeScript and Python: `ErrnoException.code`).
+- Base hard links are independent merged entries. A copy-up of one path does not change the others.
+- Copy-up copies the full file. v1 has no partial copy-up.
+- Special files that are created in the delta follow the Virtual Filesystem section.
+- v1 does not specify: crash atomicity of multi-step operations, timestamp fidelity on copy-up, `ino` stability across reopen, reads through a handle after its entry is removed, directory redirects, hard-link identity across layers, concurrent readers, re-binding a v1 overlay to another base, and mount session lifecycle.
+
+### Decisions
+
+| Decision | Rationale | Rejected alternative |
+|----------|-----------|----------------------|
+| A delta entry wins over a whiteout | A whiteout then also marks an opaque directory, so v1 needs no opaque flag. | Whiteout checked first (hides recreated entries) |
+| Whiteouts are never deleted | Create and delete need no whiteout bookkeeping. | Delete on create (base children come back) |
+| No `parent_path` column | No v1 query lists child whiteouts; coverage uses point lookups on `path`. | Keep `parent_path` and its index with no reader |
+| Origin is a base path, never read by semantics | Stable and portable to all adapters; stale origins cannot change a stat. | Base inode numbers (unstable, not portable) |
+| Directory rename copies up the subtree | No new schema; lookup stays a pure path merge. | Redirects (new table); `EXDEV` (breaks SDK callers) |
+| Copy-up on first change, never on open | TypeScript and Python `open` has no flags; one rule fits every SDK. | Copy-up on a write-intent open |
+| Instance-scoped `ino` | Browser and Cloudflare adapters have no stable inode numbers. | A persisted `ino` map |
+| One opener, enforced by a lock | Turso already takes the lock; caches need no invalidation. | Concurrent readers with generation checks |
+| Host identity is `st_ino` of the base root | Detects a replaced base; `st_dev` changes across container restarts. | Content hash (slow); `st_dev` plus `st_ino` |
+| Hard link across layers fails with `EXDEV` | A copy-up would split the base link group; tools fall back on `EXDEV`. | Copy up, then link |
+| Lower special files fail with `ENOTSUP` | Copying a FIFO or device by content blocks or corrupts. | Copy-up as a new special file |
+| Diff is a set comparison of two trees | Independent of storage; no host probes; correct for symlinks. | Probe host paths with `exists()` |
+| Management operations take a database path | Matches `.agentfs/<id>.db`; no new layout. | An overlay store with generated ids |
+| Unknown version fails, migration is one transaction | Old SDKs never rewrite newer formats; failures leave legacy data intact. | Best-effort upgrade |
+| Legacy migration trusts the base given at the first v1 open | Legacy databases store no identity, and Rust already rewrites `base_path` on each open. | Reject legacy databases |
+
+### Conformance Cases
+
+Each case starts with a new overlay over this base. `write P "s"` creates P if it is absent and replaces its content. `read P` returns the full content. `open` uses read-write flags where the SDK has flags. `reopen` closes the overlay and calls `openMerged` again. `diff →` lists changes in text form, separated by `;`. Modes are octal.
+
+```
+/f        regular file "base", mode 0644
+/d/       directory, mode 0750
+/d/x      regular file "x"
+/d/sub/   directory
+/d/sub/y  regular file "y"
+/e/       empty directory
+/l        symlink "d/x"
+/p        FIFO
 ```
 
-##### Get Origin Inode
-
-When stat'ing a file that exists in delta, check if it has an origin:
-
-```sql
-SELECT base_ino FROM fs_origin WHERE delta_ino = ?
-```
-
-If a mapping exists, return `base_ino` instead of `delta_ino` in stat results.
-
-### Consistency Rules
-
-1. A whiteout MUST be removed when a new file is created at that path
-2. A whiteout MUST be created when deleting a file that exists in the base layer
-3. The `parent_path` MUST be correctly derived from `path`
-4. Whiteouts only affect overlay lookups, not the underlying base filesystem
-5. When copying a file from base to delta, the origin mapping MUST be stored
-6. When stat'ing a delta file with an origin mapping, the base inode MUST be returned
+1. `readdir /` → `d e f l p`; `diff` → empty.
+2. `h = open /f`; `h.read` → `base`; `reopen`; `diff` → empty.
+3. `write /f "new"`; `read /f` → `new`; base `/f` → `base`; `diff` → `M f /f`.
+4. `h = open /f`; `write /f "new"` by path; `h.read` → `new`.
+5. `chmod /f 0600`; `reopen`; `stat /f` → permission bits `0600`; `diff` → `M f /f`.
+6. `write /d/x "x2"`; `stat /d` → permission bits `0750`; `diff` → `M d /d; M f /d/x`.
+7. `write /d/n "n"`; `readdir /d` → `n sub x`; `diff` → `M d /d; A f /d/n`.
+8. `unlink /f`; `stat /f` → `ENOENT`; `readdir /` → `d e l p`; `diff` → `D f /f`.
+9. `unlink /f`; `write /f "again"`; `reopen`; `read /f` → `again`; `diff` → `M f /f`.
+10. `rmdir /d` → `ENOTEMPTY`; `unlink /d` → `EISDIR`; `rmdir /f` → `ENOTDIR`; `mkdir /d` → `EEXIST`.
+11. `unlink /d/sub/y`; `rmdir /d/sub`; `unlink /d/x`; `rmdir /d`; `readdir /` → `e f l p`; `diff` → `D d /d; D d /d/sub; D f /d/sub/y; D f /d/x`.
+12. Case 11, then `mkdir /d`; `reopen`; `readdir /d` → empty; `diff` → `M d /d; D d /d/sub; D f /d/sub/y; D f /d/x`.
+13. Case 11, then `write /d "z"`; `stat /d/x` → `ENOTDIR`; `diff` → `M f /d; D d /d/sub; D f /d/sub/y; D f /d/x`.
+14. `rename /f /f`; `read /f` → `base`; `diff` → empty.
+15. `rename /d /d`; `readdir /d` → `sub x`; `diff` → empty.
+16. `write /n "1"`; `link /n /n2`; `rename /n /n2`; `stat /n` and `stat /n2` succeed.
+17. `rename /f /g`; `stat /f` → `ENOENT`; `read /g` → `base`; `diff` → `D f /f; A f /g`.
+18. `rename /d /m`; `reopen`; `readdir /m` → `sub x`; `read /m/sub/y` → `y`; `stat /d` → `ENOENT`; `diff` → `D d /d; D d /d/sub; D f /d/sub/y; D f /d/x; A d /m; A d /m/sub; A f /m/sub/y; A f /m/x`.
+19. `rename /d /m`; `mkdir /d`; `readdir /d` → empty.
+20. `rename /d /e`; `readdir /e` → `sub x`; `stat /d` → `ENOENT`; `diff` → `D d /d; D d /d/sub; D f /d/sub/y; D f /d/x; M d /e; A d /e/sub; A f /e/sub/y; A f /e/x`.
+21. `rename /f /d/x`; `read /d/x` → `base`; `stat /f` → `ENOENT`; `diff` → `M d /d; M f /d/x; D f /f`.
+22. `rename /d /d/sub/z` → `EINVAL`; `rename /e /d` → `ENOTEMPTY`; `rename /f /e` → `EISDIR`; `rename /e /f` → `ENOTDIR`.
+23. `mkdir /k`; `write /k/a "1"`; `rename /k /k2`; `readdir /k2` → `a`; `diff` → `A d /k2; A f /k2/a`.
+24. `read /l` → `x`; `write /d/x "x2"`; `read /l` → `x2`; `readlink /l` → `d/x`; `lstat /l` → symlink.
+25. `unlink /d/x`; `read /l` → `ENOENT`; `lstat /l` → symlink.
+26. `symlink "/d/x" /a`; `read /a` → `x`; `diff` → `A l /a`.
+27. `symlink "b" /a`; `symlink "a" /b`; `stat /a` → `ELOOP`.
+28. `i = stat(/f).ino`; `write /f "new"`; `rename /f /g`; `stat(/g).ino` → `i`; `readdir-plus /` entry `g` → `ino` `i`; `stat(/).ino` → `1`; `stat(/d).ino` ≠ `i`.
+29. `chmod /d 0700`; `write /d/x "z"`; `reopen`; `readdir-plus /` entry `d` and `stat /d` → permission bits `0700`; `readdir-plus /d` entry `x` and `stat /d/x` → size `1`.
+30. `link /f /f2` → `EXDEV`; `write /n "1"`; `link /n /n2`; `stat(/n).ino` = `stat(/n2).ino`.
+31. `chmod /p 0600` → `ENOTSUP`; `open /p` → `ENOTSUP`; `rename /p /q` → `ENOTSUP`; `unlink /p`; `diff` → `D ? /p`.
+32. Keep overlay A open; `openMerged` of its database → `EBUSY`; `deleteOverlay` → `EBUSY`; close A; `openMerged` succeeds.
+33. Set `version` to `2`; `openMerged` → `ENOTSUP`; the rows of `fs_overlay_config`, `fs_whiteout` and `fs_origin` are unchanged.
+34. `createOverlay(db, base)`; `openMerged(db, other directory)` → `ESTALE`; `openMerged(plain AgentFS database)` without base → `EINVAL`.
+35. Legacy Rust database (`unlink /f`, `write /d/x "x2"`); `openMerged` with base → `version` `1`; the `fs_whiteout` rows are unchanged; `fs_origin` → `/d`, `/d/x`; `diff` → `M d /d; M f /d/x; D f /f`.
+36. Legacy Go database with a whiteout row for `/f`: `openMerged` without base → `EINVAL`; with base → `version` `1`; `fs_whiteout` has row `/f` and no `parent_path` column; `stat /f` → `ENOENT`.
+37. `createOverlay(dir/a.db, base)`; again → `EEXIST`; `listOverlays(dir)` and `listOverlays(dir, base)` → `dir/a.db`; `listOverlays(dir, other directory)` → empty; `deleteOverlay(dir/a.db)`; `listOverlays(dir)` → empty.
 
 ## Key-Value Data
 
@@ -697,6 +852,12 @@ Implementations MAY extend the key-value store schema with additional functional
 Such extensions SHOULD use separate tables to maintain referential integrity.
 
 ## Revision History
+
+### Overlay Format v1
+
+- Replaced the Overlay Filesystem section with overlay format v1: `fs_overlay_config` (`version`, `base_path`, `base_identity`), `fs_whiteout` without `parent_path`, and `fs_origin` with `lower_path` in place of `base_ino`
+- Defined lookup, copy-up, mutations, rename, symlink resolution, stat identity, the writer policy, migration, management operations, diff, unsupported operations and conformance cases
+- The AgentFS schema version stays 0.4
 
 ### Version 0.4
 
