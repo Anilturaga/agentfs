@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Database } from '@tursodatabase/database';
 import { execFileSync, spawn } from 'node:child_process';
-import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,6 +44,7 @@ describe('overlay management', () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await overlay?.close();
     overlay = undefined;
   });
@@ -161,6 +162,63 @@ describe('overlay management', () => {
     const go = join(root, 'go.db');
     await raw(go, 'CREATE TABLE fs_whiteout (path TEXT PRIMARY KEY, parent_path TEXT NOT NULL, created_at INTEGER NOT NULL)');
     expect(await code(openMerged(go, base))).toBe('ENOTSUP');
+  });
+
+  it('rejects a regular file as base with ENOTDIR and keeps the old binding', async () => {
+    const file = join(base, 'f');
+    expect(await code(createOverlay(join(root, 'new.db'), file))).toBe('ENOTDIR');
+    expect(existsSync(join(root, 'new.db'))).toBe(false);
+    await createOverlay(db, base);
+    expect(await code(rebindOverlay(db, file))).toBe('ENOTDIR');
+    expect(await code(openMerged(db, file))).toBe('ENOTDIR');
+    expect((await listOverlays(root, base)).map((o) => o.path)).toEqual([db]);
+    overlay = await openMerged(db);
+    expect(await overlay.readFile('/f', 'utf8')).toBe('base');
+  });
+
+  it('reserves the key while listing, so a concurrent open fails with EBUSY', async () => {
+    await createOverlay(db, base);
+    const connect = Database.prototype.connect;
+    let reading!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((r) => (reading = r));
+    const gate = new Promise<void>((r) => (release = r));
+    vi.spyOn(Database.prototype, 'connect').mockImplementation(async function (this: Database) {
+      reading();
+      await gate;
+      return connect.call(this);
+    });
+    const listing = listOverlays(root);
+    await started;
+    expect(await code(openMerged(db, base))).toBe('EBUSY');
+    release();
+    expect((await listing).map((o) => o.path)).toEqual([db]);
+    overlay = await openMerged(db, base);
+  });
+
+  const replaceAfter = (method: 'connect' | 'close') => {
+    const original = Database.prototype[method];
+    vi.spyOn(Database.prototype, method).mockImplementation(async function (this: Database) {
+      await original.call(this);
+      writeFileSync(db + '.new', 'replacement');
+      renameSync(db + '.new', db);
+    });
+  };
+
+  it('refuses to use a database whose path names another file after the open', async () => {
+    await createOverlay(db, base);
+    replaceAfter('connect');
+    expect(await code(rebindOverlay(db, base))).toBe('ENOENT');
+    expect(readFileSync(db, 'utf8')).toBe('replacement');
+  });
+
+  it('refuses to unlink a path that was replaced during deleteOverlay', async () => {
+    await createOverlay(db, base);
+    replaceAfter('close');
+    expect(await code(deleteOverlay(db))).toBe('ENOENT');
+    vi.restoreAllMocks();
+    writeFileSync(db + '-wal', 'sidecar');
+    expect([readFileSync(db, 'utf8'), readFileSync(db + '-wal', 'utf8')]).toEqual(['replacement', 'sidecar']);
   });
 
   it('rejects a lockless handle before any query and never closes it', async () => {

@@ -6,9 +6,10 @@ import { claim, fail, holder, initOverlay, mount, readConfig, rebind, release, t
 
 const secs = (ms: number) => Math.floor(ms / 1000);
 
-/** Serves the host directory `dir` as a lower layer. Fails with `ENOENT` if it does not exist. */
+/** Serves the host directory `dir` as a lower layer. Fails with `ENOENT` if it does not exist and `ENOTDIR` if it is not a directory. */
 export async function hostLower(dir: string): Promise<LowerAdapter> {
   const locator = await realpath(dir);
+  if (!(await stat(locator)).isDirectory()) fail('ENOTDIR', 'open', dir);
   return {
     locator,
     async identity() {
@@ -82,7 +83,7 @@ export async function openMerged(dbPath: string, base?: string | LowerAdapter): 
   claim(key);
   const db = new Database(dbPath);
   try {
-    await db.connect();
+    await attach(db, dbPath, key);
     return await mount(db, key, Buffer, base === undefined ? undefined : await lowerOf(base), hostLower);
   } catch (e) {
     await db.close().catch(() => {});
@@ -91,14 +92,26 @@ export async function openMerged(dbPath: string, base?: string | LowerAdapter): 
   }
 }
 
+const same = async (path: string, key: string) => (await fileKey(path)) === key || fail('ENOENT', 'open', path);
+
+/**
+ * Connects `db` only while `dbPath` names the file `key`, before and after the open. Node has no OS
+ * file lock to pin the inode, so another process that replaces the file in between is unsupported.
+ */
+async function attach(db: Database, dbPath: string, key: string): Promise<void> {
+  await same(dbPath, key);
+  await db.connect();
+  await same(dbPath, key);
+}
+
 /** Runs `fn` on a connection to the existing `dbPath` while holding its writer lock. */
-async function locked(dbPath: string, fn: (db: Database) => Promise<void>): Promise<void> {
+async function locked(dbPath: string, fn: (db: Database, key: string) => Promise<void>): Promise<void> {
   const key = await fileKey(dbPath);
   claim(key);
   const db = new Database(dbPath);
   try {
-    await db.connect();
-    await fn(db);
+    await attach(db, dbPath, key);
+    await fn(db, key);
   } catch (e) {
     throw lockError(e);
   } finally {
@@ -107,12 +120,15 @@ async function locked(dbPath: string, fn: (db: Database) => Promise<void>): Prom
   }
 }
 
-/** Deletes the overlay database `dbPath` and its engine sidecar files, the main file last. */
+/** Deletes the overlay database `dbPath` and its engine sidecar files, the main file last. Before each removal it checks that `dbPath` still names the same file. */
 export const deleteOverlay = (dbPath: string) =>
-  locked(dbPath, async (db) => {
+  locked(dbPath, async (db, key) => {
     if (!(await readConfig(db))) fail('EINVAL', 'open', dbPath);
     await db.close();
-    for (const suffix of ['-wal', '-shm', '-log', '-wal-revert', '-info', '-changes', '']) await rm(dbPath + suffix, { force: true });
+    for (const suffix of ['-wal', '-shm', '-log', '-wal-revert', '-info', '-changes', '']) {
+      await same(dbPath, key);
+      await rm(dbPath + suffix, { force: true });
+    }
   });
 
 /** Points the v1 overlay in `dbPath` at `base`. Only this call rebinds; `openMerged` never does. */
@@ -135,15 +151,18 @@ export async function listOverlays(dir: string, base?: string | LowerAdapter): P
   return found;
 }
 
-/** Reads through the instance that holds `path`, else through a read-only connection. */
+/** Reads through the instance that holds `path`, else through a read-only connection that reserves its key. */
 async function configAt(path: string) {
-  const held = holder(await fileKey(path));
+  const key = await fileKey(path);
+  const held = holder(key);
   if (held !== undefined) return held?.config();
+  claim(key);
   const db = new Database(path, { readonly: true });
   try {
     await db.connect();
     return await readConfig(db);
   } finally {
     await db.close().catch(() => {});
+    release(key);
   }
 }
