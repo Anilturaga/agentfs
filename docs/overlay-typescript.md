@@ -36,7 +36,7 @@ export interface LowerAdapter {
 chmod(path: string, mode: number): Promise<void>;           // follows the final symlink
 link(existingPath: string, newPath: string): Promise<void>; // does not follow
 diff(): Promise<Change[]>; // Change = { change: 'A' | 'M' | 'D'; type: 'f' | 'd' | 'l' | '?'; path: string }
-close(): Promise<void>;    // unregisters and closes the database connection (releases the lock); a second call does nothing
+close(): Promise<void>;    // unregisters its own key and closes its connection (releases the lock); a second call does nothing
 ```
 - Only `openMerged` constructs it. State: `db`, `lower`, `chunkSize`, `whiteouts: Set<string>` and the entry table. The set loads at open (like Rust `load_whiteouts`) and needs no invalidation, because one instance opens the database.
 - **Walk.** One primitive resolves every path argument one component at a time: `walk(path, followLast) → { parent, name, node | null, path }`. A node holds `deltaIno` (from `fs_dentry`), `covered`, and `lower` (base stats, set only if the lower resolves P and P is not covered). Precedence and symlink rules are the spec's: more than 40 links → `ELOOP`; `..` goes to the merged parent; an absolute target starts at the merged root. A missing or non-directory intermediate component fails with `ENOENT` or `ENOTDIR`.
@@ -57,14 +57,14 @@ close(): Promise<void>;    // unregisters and closes the database connection (re
 | `rebindOverlay` | `rebindOverlay(dbPath: string, base: string \| LowerAdapter): Promise<void>` | `rebindOverlay(db, base: LowerAdapter)` |
 
 - `OverlayInfo = { path: string; version: number; basePath: string; baseIdentity: string }`; a legacy overlay has `version` 0 and `baseIdentity` `''`. A string `base` means `hostLower(base)`. On a handle, "`dbPath` exists" (`EEXIST`) means the database has a table.
-- Node takes paths only, and the SDK opens and closes every connection itself. The browser `openMerged(db, base)` owns `db` from the call on: it closes `db` if it fails, and `close()` closes it. `createOverlay` and `rebindOverlay` leave `db` open and owned by the caller.
+- **Ownership: a call releases only what it acquired.** Each management call first checks the storage key. On `EBUSY`, or `ENOTSUP` for a lockless handle, it returns at once and touches no connection, handle or reservation. Otherwise it reserves the key. After that, a failure unregisters only its own reservation and closes only the connections it opened, plus the browser `db` that `openMerged` took over when it reserved the key; Node `createOverlay` also deletes the file it created. Node takes paths only, and the SDK opens and closes every Node connection itself. Browser `createOverlay` and `rebindOverlay` never close `db`, and they unregister their reservation before they return. `listOverlays` reads a held overlay through its instance and closes only its own read-only connections.
 - Checks run in the spec's order and throw `createFsError`, so `err.code` is the POSIX name. Add `EBUSY`, `EXDEV`, `ENOTSUP`, `ESTALE` and `ELOOP` to `FsErrorCode`, and `chmod` and `link` to `FsSyscall` (`src/errors.ts`).
 - `openMerged` classifies the database **before** `AgentFS.fromDatabase`, because `initialize()` writes (case 33: "do not write"). Migration runs in one `BEGIN`…`COMMIT` with the statements of Rust `OverlayFS::migrate` (`overlayfs.rs:213`).
 - `deleteOverlay` deletes `dbPath` and the sidecars `-wal`, `-shm`, `-log`, `-wal-revert`, `-info` and `-changes`; a missing sidecar is not an error.
-- `listOverlays` opens each `*.db` with `{ readonly: true }` and skips a file it cannot open. It reads an overlay that this process holds through the registered instance. See Q2.
+- `listOverlays` opens each `*.db` with `{ readonly: true }` and skips a file it cannot open. It reads an overlay that this process holds through the registered instance, and skips a key that an in-flight call has reserved. See Q2.
 
 ## Writer lock per target
-A module registry `Map<string | DatabasePromise, OverlayFS>` maps a storage key to its open overlay. `openMerged`, `deleteOverlay` and `rebindOverlay` check the key (`EBUSY`) and register it in one synchronous step as soon as the key is known. They unregister on failure and in `close()`; `close()` then closes the connection, which releases the engine lock.
+A module registry `Map<string | DatabasePromise, OverlayFS | null>` maps a storage key to its open overlay (`null` while a call holds the reservation). `createOverlay`, `openMerged`, `deleteOverlay` and `rebindOverlay` check the key (`EBUSY`) and reserve it in one synchronous step as soon as the key is known (Ownership above). `close()` unregisters the key only while it maps to this instance, then closes the connection, which releases the engine lock.
 
 | Target | Storage key | Other processes or contexts | Result |
 |---|---|---|---|
@@ -89,7 +89,7 @@ A module registry `Map<string | DatabasePromise, OverlayFS>` maps a storage key 
 | `chmod`/`link` only on `OverlayFS` | Add them to `FileSystem` (forces `AgentFS` and Cloudflare changes) |
 | Pruned `diff()` | Full base walk (≈10 fewer lines; O(base) reads, slow for remote injected lowers) |
 | Storage key `file:<st_dev>:<st_ino>`; Node takes paths only | `realpath` or handle-object keys (miss hard links and second handles, as the Gatekeeper probe showed) |
-| `openMerged` owns a browser handle and closes it | Leave it open (`close()` could not release the engine lock) |
+| `openMerged` takes over a browser handle only after it reserves the key | Leave it open (`close()` could not release the engine lock); take it over at the call (an `EBUSY` retry with the same handle would close the active overlay's connection) |
 | One child process group per case, killed by the parent | Vitest timeout + `test.fails` (accepts a timed-out xfail; the case keeps running in the next test's worker) |
 | BigInt stats for identity | Number stats (inexact above 2^53) |
 
@@ -123,23 +123,23 @@ A module registry `Map<string | DatabasePromise, OverlayFS>` maps a storage key 
 | 12c management | Migration, `listOverlays`, `deleteOverlay`, `rebindOverlay`, serverless `ENOTSUP`, interop test | 12b's branch | 90 |
 
 - Each verifies with `cd sdk/typescript && npm ci && npm run build && npm test && npm run test:conformance`, plus V7 (12a) or V8 (12c).
-- 12a AC: V1 with cases 1, 2, 33 and 34 passing and every other case marked `xfail_ts` with 12b or 12c; V2, V3, V4 (first half), V5 (except its `deleteOverlay` step), V7, V10, V11.
+- 12a AC: V1 with cases 1, 2, 33 and 34 passing and every other case marked `xfail_ts` with 12b or 12c; V2, V3, V4 (first half), V5 (except its `deleteOverlay` step), V7, V10 (except its `rebindOverlay` step), V11.
 - 12b AC: V1 with every case passing except 32, 35, 36, 37, 38 and 41, whose `xfail_ts` names only 12c; V4 (second half); V6.
-- 12c AC: V1 with all 42 cases passing and no `xfail_ts` left; V5 in full; V8; V9.
+- 12c AC: V1 with all 42 cases passing and no `xfail_ts` left; V5 and V10 in full; V8; V9.
 
 ## Validation criteria
 - V1: `npm run test:conformance` prints `fail 0` and the pass and xfail counts that the sub-issue states.
 - V2 (`tests/overlay.test.ts`): reads over the conformance base. `readdir('/')` = `d e f l p`; `stat('/l')` is a file; `lstat('/l')` is a symlink; `readFile('/l')` = `x`; `stat('/d')` bits = 0750; `stat('/f/x')` → `ENOTDIR`; `stat('/d/../f').ino` = `stat('/f').ino`; `open('/p')` → `ENOTSUP` within 1 s.
 - V3: after V2, the row counts of `fs_inode`, `fs_dentry`, `fs_whiteout` and `fs_origin` are unchanged; `stat('/').ino` = 1; each `readdirPlus('/')` `ino` equals the `stat` `ino`.
 - V4: base with 10,000 files in `/big`, read through a counting wrapper around `hostLower`. `diff()` = `[]` and `readdir` returned < 100 names in total. In 12b: after `writeFile('/big/f1', 'x')`, the `diff()` text is `M d /big; M f /big/f1`, still < 100 names.
-- V5: while the test holds `openMerged(p)`, each of `openMerged(p)`, `openMerged(<hard link to p>)`, `openMerged(<symlink to p>)` and `deleteOverlay(<hard link to p>)` fails with `EBUSY`, and a child `node` process that imports `dist/index_node.js` prints `EBUSY` for `openMerged(p)`. After `close()`, the same child prints `OK` (it opens and closes `p`).
+- V5: while the test holds overlay A = `openMerged(p)`, each of `openMerged(p)`, `openMerged(<hard link to p>)`, `openMerged(<symlink to p>)` and `deleteOverlay(<hard link to p>)` fails with `EBUSY`, and after each one A still reads `/f` = `base` and `p` still exists. A child `node` process that imports `dist/index_node.js` prints `EBUSY` for `openMerged(p)`. After `A.close()`, the same child prints `OK` (it opens and closes `p`). Then B = `openMerged(p)`; a second `A.close()` leaves B readable.
 - V6: a handle test: `h = open('/f')`; `unlink('/f')`; `h.pwrite` → `ENOENT`. With cases 30–34 and 38, V5 and V9, every row of the spec's "Unsupported in v1" table has a test.
 - V7: `cd sdk/typescript && npm run build && ! grep -lE "from ['\"](node:)?(fs|fs/promises|path|os|child_process)['\"]" dist/overlay/overlayfs.js && ! grep -q overlay/node dist/index_browser.js`.
 - V8: interop, `tests/overlay-interop.test.ts` (`npm test` skips it; `npm run test:interop` fails without `AGENTFS_BIN`). Command: `cd cli && RUSTUP_TOOLCHAIN=nightly-2026-03-01 cargo build && cd ../sdk/typescript && AGENTFS_BIN=$PWD/../../cli/target/debug/agentfs npm run test:interop`.
   - Rust → TS: `agentfs init --base <base> r`, `agentfs fs r write /d/x x2`, `agentfs fs r write /n 1`. TS `openMerged('.agentfs/r.db')` reads `/d/x` = `x2`, `/n` = `1`, `/f` = `base`, and its `diff()` lines equal the `agentfs diff r` stdout lines. Case 35 covers Rust-written whiteouts and origins.
   - TS → Rust: TS `createOverlay`, `openMerged`, `unlink('/f')`, `writeFile('/d/x', 'x2')`, `rename('/d/sub', '/d/s2')`, `symlink('d/x', '/a')`, `close()`. Then `agentfs fs <db> cat /d/x` = `x2`, `agentfs fs <db> cat /d/s2/y` = `y`, `agentfs fs <db> ls /` has no `f`, and the `agentfs diff <db>` lines equal the TS `diff()` lines.
-- V9: the handle-form `openMerged(createServerlessAdapter(conn), lower)` fails with `ENOTSUP` before any query.
-- V10: the browser handle form, tested in Node with `@tursodatabase/database` handles: a second handle on the same file → `EBUSY`; after `close()`, a query on the handle fails and a child process opens the file; `openMerged(db, <lower of another directory>)` → `ESTALE` and also closes `db`.
+- V9: the handle-form `openMerged` of a handle marked `lockless: true` (as `createServerlessAdapter` marks its result) fails with `ENOTSUP` before any query, and a spy shows that the handle's `close()` was not called.
+- V10: the browser handle form, tested in Node with `@tursodatabase/database` handles, with overlay A = `openMerged(db, lower)`. `openMerged(db, lower)` again → `EBUSY`, then A still reads `/f` = `base`. A second handle `db2` on the same file → `EBUSY`, then a query on `db2` succeeds and A still reads. `rebindOverlay(db2, lower)` → `EBUSY`, and A still reads. After `A.close()`, a query on `db` fails and a child process opens the file. `openMerged(db3, <lower of another directory>)` → `ESTALE` and closes `db3`.
 - V11: the runner's own test: a stub worker `sh -c '(sleep 2; echo late > M) & wait'` with timeout 1 s is a failure even with `xfail_ts`, returns within 2 s, and `M` is still empty 3 s later.
 
 ## Open questions (recommended default in bold)
