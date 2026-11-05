@@ -2,11 +2,11 @@
 
 `cases.json` encodes the 41 cases of SPEC.md "Conformance Cases". Every SDK runner executes all of them.
 
-- `base`: the shared base tree, parents first: `<path> f <octal mode> <content>`, `<path> d <octal mode>`, `<path> l <target>`, `<path> p` (FIFO). Each case gets a fresh copy and a new overlay on it.
-- `cases[]`: `id` (the spec number), `steps`, optional `xfail`, optional `timeout` (seconds, default 30). A case that exceeds its timeout fails; it must not hang the suite.
+- `base`: a POSIX shell script that builds the shared base tree in an empty directory (`umask 022`; `d` has mode 750). Each case gets a fresh copy and a new overlay on it.
+- `cases[]`: `id` (the spec number), `steps`, optional `xfail`, optional `timeout` (seconds, default 30). A case that exceeds its timeout fails and its worker must be killed.
 - A step is `[var = ]op args... [=> expected]`. Arguments are space-separated. A step without `=>` must succeed.
-- With `=>`, the result (or the POSIX error name, such as `ENOENT`) must equal `expected` exactly. `$var` in `expected` is a result bound by an earlier step. A leading `!` negates.
-- Path ops follow symlinks as the SDK path API does: `readdir P` (names joined by spaces), `stat|lstat P [type|mode|size|ino]` (default `type`: `f d l ?`; `mode`: octal permission bits), `plus DIR NAME FIELD` (readdir-plus entry), `read P`, `write P S`, `readlink P`, `mkdir|rmdir|unlink P`, `chmod P MODE`, `symlink TARGET P`, `link S D`, `rename S D`, `open H P` (read-write handle) and `hread H`, `hostRead P` (the base file), `reopen`.
+- With `=>`, the result (or the POSIX error name, such as `ENOENT`) must equal `expected` exactly. `$var` in `expected` is a result bound by an earlier step. A leading `!` requires a successful step with a different result.
+- Path ops follow symlinks as the SDK path API does: `readdir P` (names joined by spaces), `stat|lstat P [type|mode|size|ino]` (default `type`: `f d l ?`; `mode`: octal permission bits), `plus DIR NAME FIELD` (readdir-plus entry), `read P`, `write P S`, `readlink P`, `mkdir|rmdir|unlink P`, `chmod P MODE`, `symlink TARGET P`, `link S D`, `rename S D`, `open P` (the read-write handle) and `hread`, `hostRead P` (the base file), `reopen`.
 - `diff` returns the text form, changes joined by `; `.
 - Management steps: `createOverlay DB BASE`, `openMerged DB [BASE]`, `deleteOverlay DB`, `rebindOverlay DB BASE`, `listOverlays DIR [BASE]` (paths joined by spaces), `close`, `plainDb DB`, `legacyRust DB BASE`, `sql DB STATEMENT` (rows as `a|b; c|d`, `NULL` for NULL), `hostWrite|hostRm|hostMkdir P ...` (change the base).
 - `db` is the case's overlay database, `base` its base, `other` a different base, `dir` an empty directory for other databases. `openMerged` makes its overlay current for later path steps.
