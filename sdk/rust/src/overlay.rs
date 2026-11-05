@@ -94,6 +94,11 @@ fn busy(db: &str) -> Error {
     fail(libc::EBUSY, format!("overlay database is in use: {db}"))
 }
 
+fn hard_linked(db: &str) -> Error {
+    let msg = format!("hard-linked overlay database is not supported: {db}");
+    fail(libc::ENOTSUP, msg)
+}
+
 fn not_overlay(db: &str) -> Error {
     fail(libc::EINVAL, format!("not an overlay database: {db}"))
 }
@@ -117,9 +122,9 @@ type Hook = Box<dyn Fn()>;
 
 #[cfg(test)]
 thread_local! {
-    /// Runs between opening the file and locking it (0), before delete unlinks it (1), and between
-    /// creating a file and reserving it (2).
-    static HOOKS: std::cell::RefCell<[Option<Hook>; 3]> = Default::default();
+    /// Runs between opening the file and locking it (0), before delete unlinks it (1), between
+    /// creating a file and reserving it (2), between the first stat and the open (3), and before delete takes the lock again (4).
+    static HOOKS: std::cell::RefCell<[Option<Hook>; 5]> = Default::default();
 }
 
 #[cfg(test)]
@@ -168,8 +173,7 @@ impl Reservation {
                 return Err(busy(&db));
             }
             if meta.nlink() > 1 {
-                let msg = format!("hard-linked overlay database is not supported: {db}");
-                return Err(fail(libc::ENOTSUP, msg));
+                return Err(hard_linked(&db));
             }
             registry.insert(key, Entry::default());
         }
@@ -178,19 +182,24 @@ impl Reservation {
             file: None,
             db,
         };
+        #[cfg(test)]
+        hook(3);
         let file = match created {
             Some(file) => file,
             None => OpenOptions::new().read(true).write(true).open(path)?,
         };
-        let opened = file.metadata().map(|m| (m.dev(), m.ino()))?;
-        if opened != key {
+        let opened = file.metadata()?;
+        if (opened.dev(), opened.ino()) != key {
             // The path now names another file. Closing a descriptor of a held file would
             // drop that holder's lock, so it closes after the holder instead.
-            match registry().get_mut(&opened) {
+            match registry().get_mut(&(opened.dev(), opened.ino())) {
                 Some(entry) => entry.parked.push(file),
                 None => drop(file),
             }
             return Err(not_found(&held.db));
+        }
+        if opened.nlink() > 1 {
+            return Err(hard_linked(&held.db));
         }
         held.file = Some(file);
         #[cfg(test)]
@@ -207,9 +216,11 @@ impl Reservation {
             }
             Err(e) => return Err(e.into()),
         }
-        match key_of(path) {
-            Ok(key) if key == self.key => Ok(()),
-            _ => Err(not_found(&self.db)),
+        match std::fs::metadata(path) {
+            Ok(m) if (m.dev(), m.ino()) != self.key => Err(not_found(&self.db)),
+            Ok(m) if m.nlink() > 1 => Err(hard_linked(&self.db)),
+            Ok(_) => Ok(()),
+            Err(_) => Err(not_found(&self.db)),
         }
     }
 }
@@ -398,6 +409,8 @@ pub async fn delete_overlay(db: AgentFSOptions) -> Result<()> {
         }
     }
     // Closing the engine's descriptors dropped the lock; take it again before removing files.
+    #[cfg(test)]
+    hook(4);
     held.lock(Path::new(&path))?;
     for suffix in SIDECARS {
         match std::fs::remove_file(format!("{path}{suffix}")) {
@@ -543,6 +556,41 @@ mod tests {
         HOOKS.with(|hooks| hooks.borrow_mut()[2] = None);
         assert!(opened.is_err());
         assert_eq!(std::fs::read(&db).unwrap(), b"populated");
+    }
+
+    #[tokio::test]
+    async fn a_link_made_after_the_first_stat_is_refused_and_nothing_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, base) = overlay(dir.path()).await;
+        let merged = open_merged(opts(&db), None).await.unwrap();
+        merged.kv.set("k", &"v").await.unwrap();
+        drop(merged);
+        let (bytes, log) = (std::fs::read(&db).unwrap(), format!("{}-wal", db.display()));
+        let logged = std::fs::read(&log).ok();
+        let alias = dir.path().join("alias.db");
+        let stages = [3, 0]
+            .into_iter()
+            .flat_map(|s| (0..4).map(move |op| (s, op)));
+        for (stage, op) in stages.chain([(4, 3)]) {
+            let (from, to) = (db.clone(), alias.clone());
+            set_hook(stage, move || std::fs::hard_link(&from, &to).unwrap());
+            let refused = match op {
+                0 => errno(open_merged(opts(&db), None).await),
+                1 => AgentFS::open(opts(&db)).await.err().and_then(|e| e.errno()),
+                2 => errno(rebind_overlay(opts(&db), &base).await),
+                _ => errno(delete_overlay(opts(&db)).await),
+            };
+            HOOKS.with(|hooks| hooks.borrow_mut()[stage] = None);
+            assert_eq!(refused, Some(libc::ENOTSUP), "stage {stage} operation {op}");
+            assert_eq!(std::fs::read(&alias).unwrap(), bytes);
+            assert_eq!(std::fs::read(&log).ok(), logged);
+            std::fs::remove_file(&alias).unwrap();
+        }
+        let merged = open_merged(opts(&db), None).await.unwrap();
+        assert_eq!(
+            merged.kv.get::<String>("k").await.unwrap().as_deref(),
+            Some("v")
+        );
     }
 
     #[tokio::test]
