@@ -2,6 +2,8 @@
 
 import asyncio
 import contextlib
+import errno
+import fcntl
 import functools
 import gc
 import itertools
@@ -34,7 +36,7 @@ _LEGACY = (
     "legacy overlay database: open it once with the agentfs CLI or Rust SDK to upgrade to format v1"
 )
 _SIDECARS = ("-wal", "-shm", "-log", "-wal-revert", "-info", "-changes")
-_held: set[tuple[int, int]] = set()
+_held: dict[tuple[int, int], "OverlayInfo | None"] = {}
 
 
 def _fail(code: FsErrorCode, syscall: FsSyscall, path: str | None = None) -> NoReturn:
@@ -168,18 +170,38 @@ class _Lock:
 
     db: Connection | None = None
     key: tuple[int, int] | None = None
+    fd: int | None = None
+
+    def _pin(self, path: str, syscall: FsSyscall) -> None:
+        """Opens and locks the existing file, so a delete cannot run before the engine opens it."""
+        try:
+            self.fd = os.open(path, os.O_RDWR)
+            fcntl.lockf(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            same = [(s.st_dev, s.st_ino) for s in (os.fstat(self.fd), os.stat(path))]
+        except FileNotFoundError:
+            _fail("ENOENT", syscall, path)
+        except OSError as e:
+            if e.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            _fail("EBUSY", syscall, path)
+        if same != [self.key] * 2:
+            _fail("ENOENT", syscall, path)
 
     async def take(self, path: str, syscall: FsSyscall, create: bool = False) -> None:
-        if os.path.exists(path):
+        try:
             st = os.stat(path)
-            if (st.st_dev, st.st_ino) in _held:
+        except FileNotFoundError:
+            if not create:
+                _fail("ENOENT", syscall, path)
+        else:
+            key = (st.st_dev, st.st_ino)
+            if key in _held:
                 _fail("EBUSY", syscall, path)
             if st.st_nlink > 1:
                 _fail("ENOTSUP", syscall, path)
-            self.key = (st.st_dev, st.st_ino)
-            _held.add(self.key)
-        elif not create:
-            _fail("ENOENT", syscall, path)
+            self.key = key
+            _held[key] = None
+            self._pin(path, syscall)
         try:
             self.db = await connect(path)
         except turso.DatabaseError as e:
@@ -197,8 +219,10 @@ class _Lock:
             del db
             traceback.clear_frames(sys.exc_info()[2])
             gc.collect()
-            _held.discard(self.key)
-            self.key = None
+            _held.pop(self.key, None)
+            if self.fd is not None:
+                os.close(self.fd)
+            self.key = self.fd = None
 
 
 class OverlayFile:
@@ -679,6 +703,7 @@ async def _mount(lock: _Lock, path: str, base: Base | None) -> OverlayFS:
     fs = OverlayFS(lock, await Filesystem.from_database(db), lower)
     fs._whiteouts = {r[0] for r in await _q(db, "SELECT path FROM fs_whiteout")}
     fs._root = _Node(1, "/", await fs._stats(1, 1, "/"), 1, await lower.lstat("/"))
+    _held[lock.key] = OverlayInfo(path, 1, config.get("base_path", lower.locator), identity)
     return fs
 
 
@@ -725,27 +750,31 @@ async def list_overlays(dir: DbPath, base: Base | None = None) -> list[OverlayIn
     lower = _lower(base) if base is not None else None
     identity = await lower.identity() if lower else None
     found = []
-    for name in sorted(os.listdir(dir)):
+    for name in sorted(n for n in os.listdir(dir) if n.endswith(".db")):
         path = os.path.join(dir, name)
-        st = os.lstat(path)
-        if not (name.endswith(".db") and stat.S_ISREG(st.st_mode)) or st.st_nlink > 1:
-            continue
         lock = _Lock()
         try:
-            lock.db = await connect(path)
-            config = await _config(lock.db)
-            info = OverlayInfo(
-                path,
-                int(config.get("version", 0)),
-                config["base_path"],
-                config.get("base_identity", ""),
-            )
+            st = os.lstat(path)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if (st.st_dev, st.st_ino) in _held:
+                held = _held[st.st_dev, st.st_ino]
+                info = held and replace(held, path=path)
+            else:
+                await lock.take(path, "list_overlays")
+                config = await _config(lock.db)
+                info = OverlayInfo(
+                    path,
+                    int(config.get("version", 0)),
+                    config["base_path"],
+                    config.get("base_identity", ""),
+                )
         except Exception:
             continue
         finally:
             await lock.release()
-        legacy = not info.base_identity and lower and info.base_path == lower.locator
-        if lower is None or info.base_identity == identity or legacy:
+        legacy = info and not info.base_identity and lower and info.base_path == lower.locator
+        if info and (lower is None or info.base_identity == identity or legacy):
             found.append(info)
     return found
 
