@@ -151,8 +151,8 @@ CREATE TABLE fs_config (
 
 **Notes:**
 
-- `chunk_size` determines the fixed size of data chunks in `fs_data`
-- All chunks except the last chunk of a file are exactly `chunk_size` bytes
+- `chunk_size` determines the chunk layout in `fs_data`: chunk `i` of a file starts at byte offset `i * chunk_size`
+- A chunk holds at most `chunk_size` bytes. Any chunk MAY be shorter or missing (see `fs_data`)
 - Configuration is immutable after filesystem initialization
 - Implementations MAY define additional configuration keys
 
@@ -256,7 +256,7 @@ CREATE INDEX idx_fs_dentry_parent ON fs_dentry(parent_ino, name)
 
 #### Table: `fs_data`
 
-Stores file content in fixed-size chunks. Chunk size is configured at filesystem level via `fs_config`.
+Stores file content in chunks of at most `chunk_size` bytes. Chunk size is configured at filesystem level via `fs_config`.
 
 ```sql
 CREATE TABLE fs_data (
@@ -271,15 +271,16 @@ CREATE TABLE fs_data (
 
 - `ino` - Inode number
 - `chunk_index` - Zero-based chunk index (chunk 0 contains bytes 0 to chunk_size-1)
-- `data` - Binary content (BLOB), exactly `chunk_size` bytes except for the last chunk
+- `data` - Binary content (BLOB), at most `chunk_size` bytes
 
 **Notes:**
 
 - Directories MUST NOT have data chunks
 - Chunk size is determined by the `chunk_size` value in `fs_config`
-- All chunks except the last chunk of a file MUST be exactly `chunk_size` bytes
-- The last chunk MAY be smaller than `chunk_size`
+- Any chunk MAY be shorter than `chunk_size`, and any chunk MAY be missing
 - Byte offset for a chunk = `chunk_index * chunk_size`
+- The file length is `fs_inode.size`, not the total length of the chunks
+- A byte below `fs_inode.size` that no chunk covers reads as zero. Chunk bytes at or past `fs_inode.size` are not file content
 - To read at byte offset `N`: `chunk_index = N / chunk_size`, `offset_in_chunk = N % chunk_size`
 
 #### Table: `fs_symlink`
@@ -348,11 +349,12 @@ To resolve a path to an inode:
 #### Reading a File
 
 1. Resolve path to inode
-2. Fetch all chunks in order:
+2. Fetch the file size and the chunks:
    ```sql
-   SELECT data FROM fs_data WHERE ino = ? ORDER BY chunk_index ASC
+   SELECT size FROM fs_inode WHERE ino = ?
+   SELECT chunk_index, data FROM fs_data WHERE ino = ?
    ```
-3. Concatenate chunks in order
+3. Allocate `size` zero bytes. Copy each chunk to byte offset `chunk_index * chunk_size` (`chunk_size` from `fs_config`), and drop the chunk bytes at or past `size`
 4. Update access time:
    ```sql
    UPDATE fs_inode SET atime = ? WHERE ino = ?
@@ -376,10 +378,7 @@ To read `length` bytes starting at byte offset `offset`:
    WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ?
    ORDER BY chunk_index ASC
    ```
-5. Extract the requested byte range from the chunks:
-   - `offset_in_first_chunk = offset % chunk_size`
-   - Skip first `offset_in_first_chunk` bytes of first chunk
-   - Take `length` total bytes across chunks
+5. Get `size` from `fs_inode`. Place the fetched chunks as in Reading a File step 3. Return the bytes from offset `offset` through offset `min(offset + length, size) - 1`. If `offset >= size`, return no bytes
 
 #### Listing a Directory
 
@@ -459,7 +458,7 @@ Where `16877` = `0o040755` (directory with rwxr-xr-x permissions)
 4. No directory MAY contain duplicate names
 5. Directories MUST have mode with S_IFDIR bit set
 6. Regular files MUST have mode with S_IFREG bit set
-7. File size MUST match total size of all data chunks
+7. File size is `fs_inode.size`. It MAY differ from the total size of the data chunks
 8. Every inode MUST have at least one dentry (except root)
 
 ### Implementation Notes
@@ -664,7 +663,7 @@ Every SDK exposes these operations in its own naming style. `base` is a host dir
 - `MergedFS` - The SDK's filesystem interface with the semantics of this section, plus `diff()` and `close()`. `close()` releases the lock.
 - `MergedFS.diff() → Change[]` - See Diff.
 - `listOverlays(dir, base?) → OverlayInfo[]` - Read each regular file named `*.db` directly in `dir` that has `fs_overlay_config`. Skip files that cannot be read (for example encrypted databases). With `base`, keep only overlays whose `base_identity` is the identity of `base` (legacy: whose `base_path` is its canonical path). Sort by path.
-- `deleteOverlay(dbPath)` - If `dbPath` does not exist, fail with `ENOENT`. Take the lock. If the database has no `fs_overlay_config`, fail with `EINVAL`. Delete `dbPath` and its engine sidecar files (`-wal`, `-shm`, `-info`).
+- `deleteOverlay(dbPath)` - If `dbPath` does not exist, fail with `ENOENT`. Take the lock. If the database has no `fs_overlay_config`, fail with `EINVAL`. Delete `dbPath` and its engine sidecar files (`-wal`, `-shm`, `-log`, `-wal-revert`, `-info`, `-changes`).
 - `rebindOverlay(dbPath, base)` - If `dbPath` does not exist, fail with `ENOENT`. Take the lock. If `version` is absent, fail with `EINVAL`; if it is not `1`, fail with `ENOTSUP`. In one transaction, overwrite `base_path` and `base_identity` with the locator and identity of `base`. Only this explicit call rebinds; `openMerged` never rebinds.
 - `OverlayInfo` - `{ path, version, basePath, baseIdentity }`. A legacy overlay has `version` 0 and an empty `baseIdentity`.
 - `Change` - `{ change: A | M | D, type: f | d | l | ?, path }`.
@@ -688,12 +687,13 @@ Every SDK exposes these operations in its own naming style. `base` is a host dir
 | An overlay format version other than 1 | `ENOTSUP` |
 | An overlay on storage that allows concurrent clients without a lock | `ENOTSUP` |
 | A base whose identity is not `base_identity` (recover with `rebindOverlay`) | `ESTALE` |
+| A write or truncate through a handle whose lower-backed entry was removed or replaced before copy-up | `ENOENT` |
 
 - SDKs report each error with its POSIX name (TypeScript and Python: `ErrnoException.code`).
 - Base hard links are independent merged entries. A copy-up of one path does not change the others.
 - Copy-up copies the full file. v1 has no partial copy-up.
 - Special files that are created in the delta follow the Virtual Filesystem section.
-- v1 does not specify: crash atomicity of multi-step operations, timestamp fidelity on copy-up, `ino` stability across reopen, reads through a handle after its entry is removed, directory redirects, hard-link identity across layers, concurrent readers, and mount session lifecycle.
+- v1 does not specify: crash atomicity of multi-step operations, timestamp fidelity on copy-up, `ino` stability across reopen, reads or writes through a handle after its entry is removed (except the `ENOENT` row above), directory redirects, hard-link identity across layers, concurrent readers, and mount session lifecycle.
 
 ### Decisions
 
@@ -774,6 +774,7 @@ Each case starts with a new overlay over this base. `write P "s"` creates P if i
 39. On a private copy of the base: `write /d/x "x2"`; `close`; set base `/f` to `edited` and base `/d/x` to `b2`; `openMerged` without base; `read /f` → `edited`; `read /d/x` → `x2`; `diff` → `M d /d; M f /d/x`.
 40. On a private copy of the base: `write /f "new"`; `close`; replace base `/f` with a directory that contains regular file `x`; `openMerged` without base; `diff` → `M f /f; D f /f/x`.
 41. A and B are different directories. `createOverlay(dir/a.db, A)`; `openMerged(dir/a.db, A)`; `write /n "1"`; `close`; `openMerged(dir/a.db, B)` → `ESTALE`; `rebindOverlay(dir/a.db, B)`; `openMerged(dir/a.db)` succeeds; `read /n` → `1`.
+42. `i = stat(/d).ino`; `write /d/x "x2"`; `stat(/d).ino` → `i`; `readdir-plus /` entry `d` → `ino` `i`.
 
 ## Key-Value Data
 
@@ -859,6 +860,14 @@ Implementations MAY extend the key-value store schema with additional functional
 Such extensions SHOULD use separate tables to maintain referential integrity.
 
 ## Revision History
+
+### Overlay Format v1 errata
+
+- Virtual Filesystem: a chunk MAY be shorter than `chunk_size` or missing, chunk `i` starts at byte offset `i * chunk_size`, uncovered bytes read as zero, and the file length is `fs_inode.size`. Readers no longer concatenate chunks
+- `deleteOverlay` also deletes the `-log`, `-wal-revert` and `-changes` engine sidecars
+- A write or truncate through a handle whose lower-backed entry was removed or replaced before copy-up fails with `ENOENT`
+- Conformance case 6 is the spec trace again; its `ino` assertion is now case 42
+- The overlay format version stays 1 and the schema does not change
 
 ### Overlay Format v1
 
