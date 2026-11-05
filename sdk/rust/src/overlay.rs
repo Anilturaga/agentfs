@@ -117,9 +117,9 @@ type Hook = Box<dyn Fn()>;
 
 #[cfg(test)]
 thread_local! {
-    /// Runs between opening the file and locking it (0), before delete unlinks it (1), between
-    /// creating a file and reserving it (2), and before creating it (3).
-    static HOOKS: std::cell::RefCell<[Option<Hook>; 4]> = Default::default();
+    /// Runs between opening the file and locking it (0), before delete unlinks it (1), and between
+    /// creating a file and reserving it (2).
+    static HOOKS: std::cell::RefCell<[Option<Hook>; 3]> = Default::default();
 }
 
 #[cfg(test)]
@@ -129,7 +129,6 @@ fn hook(stage: usize) {
 
 pub(crate) struct Reservation {
     key: Key,
-    pub(crate) created: bool,
     file: Option<File>,
     db: String,
 }
@@ -138,8 +137,6 @@ impl Reservation {
     /// Like `acquire`, after creating the file if it is absent. The descriptor of a new file
     /// becomes the reservation's, or is parked if another opener wins.
     pub(crate) fn acquire_or_create(path: &str) -> Result<Self> {
-        #[cfg(test)]
-        hook(3);
         let created = OpenOptions::new()
             .read(true)
             .write(true)
@@ -162,18 +159,22 @@ impl Reservation {
 
     fn reserve(path: &Path, created: Option<File>) -> Result<Self> {
         let db = path.display().to_string();
-        let key = key_of(path).map_err(|_| not_found(&db))?;
+        let meta = std::fs::metadata(path).map_err(|_| not_found(&db))?;
+        let key = (meta.dev(), meta.ino());
         {
             let mut registry = registry();
             if let Some(entry) = registry.get_mut(&key) {
                 entry.parked.extend(created);
                 return Err(busy(&db));
             }
+            if meta.nlink() > 1 {
+                let msg = format!("hard-linked overlay database is not supported: {db}");
+                return Err(fail(libc::ENOTSUP, msg));
+            }
             registry.insert(key, Entry::default());
         }
         let mut held = Self {
             key,
-            created: created.is_some(),
             file: None,
             db,
         };
@@ -529,17 +530,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_remote_open_keeps_a_file_another_opener_created() {
+    async fn failed_remote_open_keeps_what_another_opener_wrote() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("new.db");
         let path = db.clone();
-        set_hook(3, move || std::fs::write(&path, b"populated").unwrap());
+        set_hook(2, move || std::fs::write(&path, b"populated").unwrap());
         let remote = SyncOptions {
             remote_url: Some("http://127.0.0.1:9".to_string()),
             ..Default::default()
         };
         let opened = AgentFS::open(opts(&db).with_sync(remote)).await;
-        HOOKS.with(|hooks| hooks.borrow_mut()[3] = None);
+        HOOKS.with(|hooks| hooks.borrow_mut()[2] = None);
         assert!(opened.is_err());
         assert_eq!(std::fs::read(&db).unwrap(), b"populated");
     }

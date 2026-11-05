@@ -343,9 +343,9 @@ impl AgentFS {
         let db_path = options.db_path()?;
         let meta_path = format!("{db_path}-info");
 
-        let (held, created) = match held {
+        let held = match held {
             None => connection_pool::ConnectionPool::reserve(&db_path)?,
-            held => (held, false),
+            held => held,
         };
 
         // Determine if this is a synced database:
@@ -362,11 +362,7 @@ impl AgentFS {
             if let Some(partial_sync) = options.sync.partial_sync {
                 builder = builder.with_partial_sync_opts_experimental(partial_sync);
             }
-            let db = builder.build().await.inspect_err(|_| {
-                if created {
-                    let _ = std::fs::remove_file(&db_path);
-                }
-            })?;
+            let db = builder.build().await?;
             let pool = connection_pool::ConnectionPool::new_sync(db.clone());
             held.into_iter().for_each(|held| pool.hold(held));
             (Some(db), pool)
