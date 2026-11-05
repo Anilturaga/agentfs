@@ -1,9 +1,12 @@
 """Overlay filesystem: a writable AgentFS delta over a read-only base."""
 
+import asyncio
+import functools
 import gc
 import itertools
 import os
 import sys
+import time
 import traceback
 from dataclasses import dataclass, replace
 from typing import Literal, NoReturn, Protocol
@@ -12,7 +15,7 @@ import turso
 from turso.aio import Connection, connect
 
 from .agentfs import AgentFS
-from .constants import S_IFDIR, S_IFLNK, S_IFMT, S_IFREG
+from .constants import DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG
 from .errors import ErrnoException, FsErrorCode, FsSyscall
 from .filesystem import Filesystem, Stats
 
@@ -39,12 +42,32 @@ def _join(directory: str, name: str) -> str:
     return ("" if directory == "/" else directory) + "/" + name
 
 
+def _parent_of(path: str) -> str:
+    return path.rsplit("/", 1)[0] or "/"
+
+
 def _is_dir(stats: Stats | None) -> bool:
     return stats is not None and stats.is_directory()
 
 
+def _locked(op):
+    """Runs a mutation alone, so concurrent copy-ups and creates cannot interleave."""
+
+    @functools.wraps(op)
+    async def run(self, *args, **kwargs):
+        async with self._mutex:
+            return await op(self, *args, **kwargs)
+
+    return run
+
+
 async def _q(db: Connection, sql: str, *args) -> list:
     return await (await db.execute(sql, args)).fetchall()
+
+
+async def _run(db: Connection, sql: str, *args) -> None:
+    await db.execute(sql, args)
+    await db.commit()
 
 
 class LowerAdapter(Protocol):
@@ -183,8 +206,15 @@ class OverlayFile:
     async def pread(self, offset: int, size: int) -> bytes:
         return await self._fs._pread(self._node, offset, size)
 
+    async def pwrite(self, offset: int, data: bytes) -> None:
+        await self._fs._splice(self._node, offset, data, True)
+
+    async def truncate(self, size: int) -> None:
+        await self._fs._splice(self._node, size, b"", False)
+
     async def fstat(self) -> Stats:
-        return await self._fs._stats(self._node.ino, self._node.delta, self._node.path)
+        node, fs = self._node, self._fs
+        return await fs._stats(node.ino, fs._delta_ino(node), node.path)
 
 
 class OverlayFS:
@@ -199,11 +229,14 @@ class OverlayFS:
         self._inos = itertools.count(2)
         self._by_delta = {1: 1}
         self._by_lower: dict[str, int] = {}
+        self._copied: dict[int, int] = {}
+        self._mutex = asyncio.Lock()
 
     async def close(self) -> None:
-        """Releases the writer lock. A second call does nothing."""
-        self._db = self._delta = None
-        await self._lock.release()
+        """Finishes the running mutation, then releases the writer lock. Safe to repeat."""
+        async with self._mutex:
+            self._db = self._delta = None
+            await self._lock.release()
 
     async def __aenter__(self) -> "OverlayFS":
         return self
@@ -219,10 +252,14 @@ class OverlayFS:
             stats = Stats(*rows[0]) if rows else None
         return replace(stats, ino=ino) if stats else _fail("ENOENT", "stat", path)
 
+    def _delta_ino(self, node: _Node) -> int | None:
+        """The delta inode of `node`, which may have been copied up after `node` was resolved."""
+        return node.delta if node.delta is not None else self._copied.get(node.ino)
+
     async def _pread(self, node: _Node, offset: int, size: int) -> bytes:
-        if node.delta is None:
+        if (delta := self._delta_ino(node)) is None:
             return await self._lower.read(node.path, offset, size)
-        return (await self._delta._read_inode(node.delta))[offset : offset + size]
+        return (await self._delta._read_inode(delta))[offset : offset + size]
 
     async def _child(self, parent: _Node, name: str) -> _Node | None:
         path = _join(parent.path, name)
@@ -249,25 +286,39 @@ class OverlayFS:
         rows = await _q(self._db, "SELECT target FROM fs_symlink WHERE ino = ?", node.delta)
         return rows[0][0] if rows else _fail("ENOENT", "readlink", node.path)
 
-    async def _find(self, path: str, follow_last: bool, syscall: FsSyscall) -> _Node:
+    async def _walk(self, path: str, follow_last: bool, syscall: FsSyscall):
+        """Resolves `path` to `(parent, name, node, dir_only, via_link)`.
+
+        `parent` and `name` locate the dentry of `node`, which is None when only the last
+        component is missing; `name` is empty after a final `.` or `..`. `dir_only` is set when
+        the path ends in `/`, `.` or `..`. `via_link` is set when a walk that does not follow
+        the last component crossed a final symlink only because of that suffix.
+        """
         stack = [self._root]
         parts = path.split("/")[::-1]
-        node: _Node | None = stack[0]
+        parent, name, node = self._root, "", self._root
+        dir_only = via_link = False
         links = 0
         while parts:
-            name = parts.pop()
-            if name in ("", ".", ".."):
-                if name == ".." and len(stack) > 1:
+            part = parts.pop()
+            if part in ("", ".", ".."):
+                if part == ".." and len(stack) > 1:
                     stack.pop()
-                node = stack[-1]
+                node, dir_only = stack[-1], True
+                name = "" if part else name
                 continue
-            node = await self._child(stack[-1], name)
+            parent, name, dir_only = stack[-1], part, False
+            node = await self._child(parent, name)
             if node is None:
+                if any(parts):
+                    _fail("ENOENT", syscall, path)
+                dir_only = bool(parts)
                 break
             if node.stats.is_symbolic_link() and (parts or follow_last):
                 links += 1
                 if links > 40:
                     _fail("ELOOP", syscall, path)
+                via_link = via_link or (not follow_last and all(p in ("", ".") for p in parts))
                 target = await self._target(node)
                 if target.startswith("/"):
                     del stack[1:]
@@ -277,6 +328,10 @@ class OverlayFS:
                 if not node.stats.is_directory():
                     _fail("ENOTDIR", syscall, path)
                 stack.append(node)
+        return parent, name, node, dir_only, via_link
+
+    async def _find(self, path: str, follow_last: bool, syscall: FsSyscall) -> _Node:
+        node = (await self._walk(path, follow_last, syscall))[2]
         return node or _fail("ENOENT", syscall, path)
 
     async def _file(self, path: str) -> _Node:
@@ -329,6 +384,211 @@ class OverlayFS:
 
     async def open(self, path: str) -> OverlayFile:
         return OverlayFile(self, await self._file(path))
+
+    async def _copy_up(self, node: _Node, content: bool = True) -> int:
+        """Copies a lower-backed entry and its lower-backed ancestors, top-down, into the delta."""
+        if (ino := self._delta_ino(node)) is not None:
+            return ino
+        low, path = node.lower, node.path
+        kind = low.mode & S_IFMT
+        if kind not in _TYPES:
+            _fail("ENOTSUP", "open", path)
+        parent = await self._copy_up(await self._find(_parent_of(path), True, "open"))
+        ino = await self._delta._create_inode(low.mode, low.uid, low.gid)
+        if kind == S_IFLNK:
+            await self._write_link(ino, await self._lower.readlink(path))
+        elif kind == S_IFREG and content and low.size:
+            await self._delta._update_file_content(ino, await self._lower.read(path, 0, low.size))
+        db, times = self._db, (low.atime, low.mtime, low.ctime)
+        await _run(
+            db, "UPDATE fs_inode SET atime = ?, mtime = ?, ctime = ? WHERE ino = ?", *times, ino
+        )
+        await _run(db, "INSERT INTO fs_origin (delta_ino, lower_path) VALUES (?, ?)", ino, path)
+        await self._delta._create_dentry(parent, path.rsplit("/", 1)[1], ino)
+        self._by_delta[ino] = node.ino
+        self._copied[node.ino] = ino
+        del self._by_lower[path]
+        return ino
+
+    async def _hide(self, parent: _Node, name: str) -> None:
+        """Inserts a whiteout if the base resolves the entry and no whiteout covers it."""
+        path = _join(parent.path, name)
+        if _is_dir(parent.lower) and path not in self._whiteouts and await self._lower.lstat(path):
+            await _run(self._db, "INSERT INTO fs_whiteout VALUES (?, ?)", path, int(time.time()))
+            self._whiteouts.add(path)
+
+    async def _write_link(self, ino: int, target: str) -> None:
+        db = self._db
+        await _run(db, "INSERT INTO fs_symlink (ino, target) VALUES (?, ?)", ino, target)
+        await _run(db, "UPDATE fs_inode SET size = ? WHERE ino = ?", len(target.encode()), ino)
+
+    async def _add(self, parent: _Node, name: str, mode: int) -> int:
+        parent_ino = await self._copy_up(parent)
+        ino = await self._delta._create_inode(mode)
+        await self._delta._create_dentry(parent_ino, name, ino)
+        return ino
+
+    async def _locate(self, path: str, syscall: FsSyscall) -> tuple[_Node, str, _Node]:
+        """Resolves an existing entry that is not the root, without following a final symlink."""
+        parent, name, node, _, via_link = await self._walk(path, False, syscall)
+        if via_link:
+            _fail("ENOTDIR", syscall, path)
+        node = node or _fail("ENOENT", syscall, path)
+        if node.path == "/":
+            _fail("EPERM", syscall, path)
+        if not name:
+            _fail("EINVAL", syscall, path)
+        return parent, name, node
+
+    async def _remove(self, parent: _Node, name: str, node: _Node) -> None:
+        if (ino := self._delta_ino(node)) is not None:
+            await self._delta._remove_dentry_and_maybe_inode(self._delta_ino(parent), name, ino)
+        await self._hide(parent, name)
+
+    async def _subtree(self, parent: _Node, name: str, node: _Node) -> list[tuple]:
+        """The merged entries at and under `node` as (parent, name, node), parents first."""
+        tree = [(parent, name, node)]
+        for _, _, n in tree:
+            if n.stats.is_directory():
+                tree += [(n, c, await self._child(n, c)) for c in await self._names(n)]
+        return tree
+
+    async def _splice(self, node: _Node, offset: int, data: bytes, keep_tail: bool) -> None:
+        """Rewrites a handle's content: old bytes before `offset`, `data`, then the old tail."""
+        if offset < 0:
+            _fail("EINVAL", "open")
+        async with self._mutex:
+            ino = self._delta_ino(node)
+            if ino is None:
+                found = (await self._walk(node.path, False, "open"))[2]
+                if found is None or found.ino != node.ino:
+                    _fail("ENOENT", "open", node.path)
+                ino = await self._copy_up(found, keep_tail or offset > 0)
+            old = await self._delta._read_inode(ino)
+            tail = old[offset + len(data) :] if keep_tail else b""
+            head = old[:offset].ljust(offset, b"\0")
+            await self._delta._update_file_content(ino, head + data + tail)
+
+    async def _write_file(self, path: str, content: str | bytes, encoding: str = "utf-8") -> None:
+        data = content.encode(encoding) if isinstance(content, str) else content
+        names = [n for n in path.split("/") if n][:-1]
+        for i in range(1, len(names) + 1):
+            directory = "/" + "/".join(names[:i])
+            if (await self._walk(directory, True, "open"))[2] is None:
+                await self._mkdir(directory)
+        parent, name, node, dir_only, _ = await self._walk(path, True, "open")
+        if dir_only or _is_dir(node and node.stats):
+            _fail("EISDIR", "open", path)
+        ino = await (
+            self._copy_up(node, False) if node else self._add(parent, name, DEFAULT_FILE_MODE)
+        )
+        await self._delta._update_file_content(ino, data)
+
+    async def _mkdir(self, path: str) -> None:
+        parent, name, node, _, via_link = await self._walk(path, False, "mkdir")
+        if node or via_link:
+            _fail("EEXIST", "mkdir", path)
+        await self._add(parent, name, DEFAULT_DIR_MODE)
+
+    async def _chmod(self, path: str, mode: int) -> None:
+        ino = await self._copy_up(await self._find(path, True, "chmod"))
+        sql = "UPDATE fs_inode SET mode = (mode & ?) | ?, ctime = ? WHERE ino = ?"
+        await _run(self._db, sql, S_IFMT, mode & 0o7777, int(time.time()), ino)
+
+    write_file = _locked(_write_file)
+    mkdir = _locked(_mkdir)
+    chmod = _locked(_chmod)
+
+    @_locked
+    async def symlink(self, target: str, path: str) -> None:
+        parent, name, node, dir_only, via_link = await self._walk(path, False, "symlink")
+        if node or via_link:
+            _fail("EEXIST", "symlink", path)
+        if dir_only:
+            _fail("ENOENT", "symlink", path)
+        await self._write_link(await self._add(parent, name, S_IFLNK | 0o777), target)
+
+    @_locked
+    async def unlink(self, path: str) -> None:
+        parent, name, node = await self._locate(path, "unlink")
+        if node.stats.is_directory():
+            _fail("EISDIR", "unlink", path)
+        await self._remove(parent, name, node)
+
+    @_locked
+    async def rmdir(self, path: str) -> None:
+        parent, name, node = await self._locate(path, "rmdir")
+        if not node.stats.is_directory():
+            _fail("ENOTDIR", "rmdir", path)
+        if await self._names(node):
+            _fail("ENOTEMPTY", "rmdir", path)
+        await self._remove(parent, name, node)
+
+    @_locked
+    async def rm(self, path: str, force: bool = False, recursive: bool = False) -> None:
+        try:
+            parent, name, node = await self._locate(path, "rm")
+        except ErrnoException as e:
+            if force and e.code == "ENOENT":
+                return
+            raise
+        if node.stats.is_directory() and not recursive:
+            _fail("EISDIR", "rm", path)
+        for entry in reversed(await self._subtree(parent, name, node)):
+            await self._remove(*entry)
+
+    @_locked
+    async def link(self, src: str, dst: str) -> None:
+        node = (await self._locate(src, "link"))[2]
+        if node.stats.is_directory():
+            _fail("EPERM", "link", src)
+        if (ino := self._delta_ino(node)) is None:
+            _fail("EXDEV", "link", src)
+        parent, name, found, dir_only, via_link = await self._walk(dst, False, "link")
+        if found or via_link:
+            _fail("EEXIST", "link", dst)
+        if dir_only:
+            _fail("ENOENT", "link", dst)
+        await self._delta._create_dentry(await self._copy_up(parent), name, ino)
+
+    @_locked
+    async def rename(self, old_path: str, new_path: str) -> None:
+        old_parent, old_name, src = await self._locate(old_path, "rename")
+        parent, name, dst, dir_only, via_link = await self._walk(new_path, False, "rename")
+        if via_link:
+            _fail("ENOTDIR", "rename", new_path)
+        dst_path = dst.path if dst else _join(parent.path, name)
+        src_delta, dst_delta = self._delta_ino(src), dst and self._delta_ino(dst)
+        if src.path == dst_path or (src_delta is not None and src_delta == dst_delta):
+            return
+        is_dir = src.stats.is_directory()
+        if (is_dir and dst_path.startswith(src.path + "/")) or not name:
+            _fail("EINVAL", "rename", new_path)
+        if dst:
+            if dst.stats.is_directory() != is_dir:
+                _fail("ENOTDIR" if is_dir else "EISDIR", "rename", new_path)
+            if is_dir and await self._names(dst):
+                _fail("ENOTEMPTY", "rename", new_path)
+        elif dir_only and not is_dir:
+            _fail("ENOTDIR", "rename", new_path)
+        tree = [n for _, _, n in await self._subtree(old_parent, old_name, src)]
+        for n in tree:
+            if n.delta is None and (n.lower.mode & S_IFMT) not in _TYPES:
+                _fail("ENOTSUP", "rename", n.path)
+        for n in tree:
+            await self._copy_up(n)
+        parent_ino = await self._copy_up(parent)
+        if dst_delta is not None:
+            await self._delta._remove_dentry_and_maybe_inode(parent_ino, name, dst_delta)
+        move = "UPDATE fs_dentry SET parent_ino = ?, name = ? WHERE parent_ino = ? AND name = ?"
+        await _run(self._db, move, parent_ino, name, self._delta_ino(old_parent), old_name)
+        await self._hide(old_parent, old_name)
+        await self._hide(parent, name)
+
+    @_locked
+    async def copy_file(self, src: str, dest: str) -> None:
+        await self._write_file(dest, await self.read_file(src, None))
+        await self._chmod(dest, (await self.stat(src)).mode)
 
     async def diff(self) -> list[Change]:
         """Merged tree vs base, walking only what a delta entry or whiteout hides."""

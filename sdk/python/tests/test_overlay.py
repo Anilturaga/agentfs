@@ -1,5 +1,6 @@
 """Overlay read path tests"""
 
+import asyncio
 import errno
 import gc
 import json
@@ -195,6 +196,8 @@ async def test_diff_does_not_walk_base(tmp_path):
     await create_overlay(tmp_path / "o.db", adapter)
     async with await open_merged(tmp_path / "o.db", adapter) as fs:
         assert await fs.diff() == []
+        await fs.write_file("/big/f1", "x")
+        assert [str(c) for c in await fs.diff()] == ["M d /big", "M f /big/f1"]
     assert adapter.names < 100
 
 
@@ -205,11 +208,15 @@ async def test_base_symlink_never_followed(tmp_path):
     base = tmp_path / "base"
     base.mkdir()
     (base / "esc").symlink_to(outside)
+    (base / "k").mkdir()
     await create_overlay(tmp_path / "o.db", base)
     async with await open_merged(tmp_path / "o.db", base) as fs:
-        with pytest.raises(ErrnoException) as excinfo:
-            await fs.read_file("/esc/s")
-    assert excinfo.value.code == "ENOENT"
+        assert await code(fs.read_file("/esc/s")) == "ENOENT"
+        await fs.chmod("/k", 0o700)
+    (base / "k").rmdir()
+    (base / "k").symlink_to(outside)
+    async with await open_merged(tmp_path / "o.db", base) as fs:
+        assert await code(fs.read_file("/k/s")) == "ENOENT"
 
 
 async def test_host_adapter_is_rooted(tmp_path):
@@ -349,3 +356,104 @@ async def test_host_adapter_reports_access_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "stat", deny)
     with pytest.raises(PermissionError):
         HostAdapter(tmp_path)
+
+
+async def test_copy_up_keeps_identity_mode_times_and_origin(overlay, base):
+    os.chmod(base / "f", 0o600)
+    os.utime(base / "e", (1_000_000_000, 1_000_000_000))
+    async with await open_merged(overlay, base) as fs:
+        ino = (await fs.stat("/f")).ino
+        handle = await fs.open("/f")
+        await handle.pwrite(0, b"B")
+        assert await handle.pread(0, 10) == b"Base"
+        await handle.pwrite(6, b"!")
+        assert await fs.read_file("/f", None) == b"Base\0\0!"
+        await handle.truncate(2)
+        assert await fs.read_file("/f", None) == b"Ba"
+        after = await fs.stat("/f")
+        assert (after.ino, after.mode & 0o7777) == (ino, 0o600)
+        await fs.write_file("/e/n", "x")
+        copied = await fs.stat("/e")
+        assert (copied.mode & 0o7777, copied.mtime) == (0o755, 1_000_000_000)
+        assert [str(c) for c in await fs.diff()] == ["M d /e", "A f /e/n", "M f /f"]
+    assert (base / "f").read_text() == "base"
+    origins = await rows(overlay, "SELECT lower_path FROM fs_origin ORDER BY lower_path")
+    assert origins == [("/e",), ("/f",)]
+
+
+async def test_handle_write_after_unlink_is_enoent(overlay, base):
+    async with await open_merged(overlay, base) as fs:
+        gone, replaced = await fs.open("/f"), await fs.open("/d/x")
+        await fs.unlink("/f")
+        assert await code(gone.pwrite(0, b"z")) == "ENOENT"
+        await fs.unlink("/d/x")
+        await fs.write_file("/d/x", "new")
+        assert await code(replaced.truncate(0)) == "ENOENT"
+        assert await code(gone.pwrite(-1, b"z")) == "EINVAL"
+        assert await fs.read_file("/d/x") == "new"
+    assert (base / "f").read_text() == "base"
+
+
+async def test_parents_rm_and_copy_file(overlay, base):
+    os.chmod(base / "f", 0o600)
+    async with await open_merged(overlay, base) as fs:
+        await fs.write_file("/n/a/b", "x")
+        await fs.copy_file("/f", "/n/copy")
+        assert await fs.read_file("/n/copy") == "base"
+        assert (await fs.stat("/n/copy")).mode & 0o7777 == 0o600
+        assert await code(fs.rm("/d")) == "EISDIR"
+        await fs.rm("/d", recursive=True)
+        await fs.rm("/nope", force=True)
+        assert await code(fs.rm("/nope")) == "ENOENT"
+        assert await fs.readdir("/") == ["e", "f", "l", "n", "p"]
+        assert [str(c) for c in await fs.diff()] == [
+            "D d /d",
+            "D d /d/sub",
+            "D f /d/sub/y",
+            "D f /d/x",
+            "A d /n",
+            "A d /n/a",
+            "A f /n/a/b",
+            "A f /n/copy",
+        ]
+
+
+async def test_mutations_resolve_dentries_by_name(overlay, base):
+    (base / "aliasd").symlink_to("d")
+    await (await open_merged(overlay, base)).close()
+    async with await open_merged(overlay, base) as fs:
+        for attempt in (
+            fs.rmdir("/aliasd/"),
+            fs.rename("/aliasd/", "/moved"),
+            fs.rm("/aliasd/", recursive=True),
+        ):
+            assert await code(attempt) == "ENOTDIR"
+        assert await code(fs.mkdir("/aliasd/")) == "EEXIST"
+        assert await code(fs.rm("/d/.", recursive=True)) == "EINVAL"
+        assert await code(fs.rename("/f", "/zz/")) == "ENOTDIR"
+        await fs.rename("/d", "/e/")
+        assert await fs.readdir("/e") == ["sub", "x"]
+
+
+async def test_concurrent_first_writes_are_serialized(overlay, base):
+    async with await open_merged(overlay, base) as fs:
+        a, b = await fs.open("/f"), await fs.open("/f")
+        await asyncio.gather(a.pwrite(0, b"A"), b.pwrite(1, b"B"))
+        assert await fs.read_file("/f") == "ABse"
+        await asyncio.gather(fs.write_file("/d/a", "A"), fs.write_file("/d/b", "B"))
+        assert await fs.readdir("/d") == ["a", "b", "sub", "x"]
+
+
+async def test_rename_of_a_deep_base_tree_and_symlink_sizes(tmp_path, overlay, base):
+    (base / "u").symlink_to("é")
+    path = base / "deep"
+    for _ in range(300):
+        path.mkdir()
+        path = path / "a"
+    async with await open_merged(overlay, base) as fs:
+        await fs.rename("/u", "/moved")
+        await fs.symlink("é", "/made")
+        assert [(await fs.lstat(p)).size for p in ("/moved", "/made")] == [2, 2]
+        await fs.rename("/deep", "/deeper")
+        await fs.rm("/deeper", recursive=True)
+        assert await code(fs.stat("/deeper/a")) == "ENOENT"
