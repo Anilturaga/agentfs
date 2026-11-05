@@ -109,7 +109,15 @@ pub async fn init_database(
     let db_path = agentfs_dir().join(format!("{}.db", id));
     if db_path.exists() {
         if force {
-            for suffix in ["", "-wal", "-shm", "-wal-revert", "-info", "-changes"] {
+            for suffix in [
+                "",
+                "-wal",
+                "-shm",
+                "-log",
+                "-wal-revert",
+                "-info",
+                "-changes",
+            ] {
                 let mut path = db_path.clone().into_os_string();
                 path.push(suffix);
                 match std::fs::remove_file(&path) {
@@ -287,6 +295,7 @@ mod tests {
             "force.db",
             "force.db-wal",
             "force.db-shm",
+            "force.db-log",
             "force.db-wal-revert",
             "force.db-info",
             "force.db-changes",
