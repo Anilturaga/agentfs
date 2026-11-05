@@ -12,6 +12,10 @@ macro_rules! errnos {
     ($($name:ident),*) => { [$((stringify!($name), libc::$name)),*] };
 }
 const CASES: &str = include_str!("../../../conformance/overlay/cases.json");
+const LEGACY_RUST_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/legacy_rust_overlay.db"
+);
 const ERRNOS: [(&str, i32); 11] = errnos![
     ENOENT, EEXIST, ENOTEMPTY, ENOTDIR, EISDIR, EINVAL, ELOOP, EXDEV, ENOTSUP, EBUSY, ESTALE
 ];
@@ -20,6 +24,7 @@ fn errno_name(e: &Error) -> String {
     let code = match e {
         Error::Fs(f) => Some(f.to_errno()),
         Error::Io(io) => io.raw_os_error(),
+        Error::UnsupportedOverlayVersion(_) => Some(libc::ENOTSUP),
         _ => None,
     };
     let known = ERRNOS.iter().find(|(_, c)| Some(*c) == code);
@@ -37,12 +42,65 @@ fn field(s: &Stats, name: &str) -> String {
     }
 }
 
-async fn open_overlay(base: &Path, db: &Path) -> OverlayFS {
-    let options = AgentFSOptions::with_path(db.to_str().unwrap()).with_base(base);
-    let agent = AgentFS::open(options).await.unwrap();
-    let overlay = OverlayFS::new(Arc::new(HostFS::new(base).unwrap()), agent.fs);
-    overlay.load().await.unwrap();
-    overlay
+/// `openMerged`: without a base, the one recorded in the database.
+async fn open_overlay(db: &Path, base: Option<&Path>) -> Result<OverlayFS> {
+    let mut options = AgentFSOptions::with_path(db.to_str().unwrap());
+    options.base = base.map(Into::into);
+    let agent = AgentFS::open(options).await?;
+    let base = agent
+        .is_overlay_enabled()
+        .await?
+        .ok_or(FsError::InvalidPath)?;
+    let overlay = OverlayFS::new(Arc::new(HostFS::new(&base)?), agent.fs);
+    overlay.load().await?;
+    Ok(overlay)
+}
+
+/// Runs `statement` on a separate connection; rows come back as `a|b; c|d`.
+async fn sql(db: &Path, statement: &str) -> Result<String> {
+    let built = turso::Builder::new_local(db.to_str().unwrap())
+        .build()
+        .await?;
+    let mut rows = built.connect()?.query(statement, ()).await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let cell = |i| match row.get_value(i).unwrap() {
+            turso::Value::Null => "NULL".into(),
+            turso::Value::Integer(n) => n.to_string(),
+            turso::Value::Text(s) => s,
+            v => format!("{v:?}"),
+        };
+        out.push(
+            (0..row.column_count())
+                .map(cell)
+                .collect::<Vec<String>>()
+                .join("|"),
+        );
+    }
+    Ok(out.join("; "))
+}
+
+/// Steps that need no overlay. Database paths are relative to `root`; host paths to the base.
+async fn run_aux(root: &Path, w: &[&str]) -> Result<String> {
+    let db = root.join(w[1]);
+    let host = &w[1][1..];
+    match w[0] {
+        "hostRead" => return Ok(std::fs::read_to_string(host)?),
+        "hostWrite" => std::fs::write(host, w[2..].join(" "))?,
+        "hostRm" => std::fs::remove_file(host)?,
+        "hostMkdir" => std::fs::create_dir(host)?,
+        "plainDb" => drop(AgentFS::open(AgentFSOptions::with_path(db.to_str().unwrap())).await?),
+        "legacyRust" => {
+            std::fs::copy(LEGACY_RUST_FIXTURE, &db)?;
+            let set = format!(
+                "UPDATE fs_overlay_config SET value = '{}' WHERE key = 'base_path'",
+                root.join(w[2]).display()
+            );
+            sql(&db, &set).await?;
+        }
+        _ => return sql(&db, &w[2..].join(" ")).await,
+    }
+    Ok(String::new())
 }
 
 /// Resolves `path` in the merged view. Symlinks are followed at every component,
@@ -84,7 +142,7 @@ async fn slurp(file: &BoxedFile) -> Result<String> {
     Ok(String::from_utf8_lossy(&file.pread(0, size).await?).into())
 }
 
-/// Runs one step. Steps the Rust SDK cannot serve yet (management operations, `diff`) fail with `ENOSYS`.
+/// Runs one overlay step. Management operations and `diff` fail with `ENOSYS`.
 async fn run_step(fs: &OverlayFS, h: &mut Option<BoxedFile>, w: &[&str]) -> Result<String> {
     let ino = |i, f| async move { Ok::<_, Error>(resolve(fs, w[i], f).await?.ino) };
     let mut out = String::new();
@@ -106,7 +164,6 @@ async fn run_step(fs: &OverlayFS, h: &mut Option<BoxedFile>, w: &[&str]) -> Resu
         "read" => out = slurp(&fs.open(ino(1, true).await?, libc::O_RDONLY).await?).await?,
         "readlink" => out = fs.readlink(ino(1, false).await?).await?.unwrap_or_default(),
         "hread" => out = slurp(h.as_ref().unwrap()).await?,
-        "hostRead" => out = std::fs::read_to_string(&w[1][1..])?,
         "open" => *h = Some(fs.open(ino(1, true).await?, libc::O_RDWR).await?),
         "write" => {
             let (dir, name) = parent(fs, w[1]).await?;
@@ -151,30 +208,51 @@ fn satisfied(want: Option<&str>, step_ok: bool, out: &str) -> bool {
 
 async fn run_steps(case: &Value, script: &str) -> std::result::Result<(), String> {
     let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().join("base");
-    std::fs::create_dir(&base).unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let base = root.join("base");
+    for sub in ["base", "other", "dir"] {
+        std::fs::create_dir(root.join(sub)).unwrap();
+    }
     std::env::set_current_dir(&base).unwrap();
     let setup = Command::new("sh").args(["-ec", script]).status().unwrap();
     assert!(setup.success(), "base setup failed");
-    let db = dir.path().join("overlay.db");
-    let mut fs = open_overlay(&base, &db).await;
+    let mut fs = Some(open_overlay(&root.join("db"), Some(&base)).await.unwrap());
     let (mut handle, mut vars) = (None, Vec::<(&str, String)>::new());
     for step in case["steps"].as_array().unwrap() {
         let step = step.as_str().unwrap();
         let (cmd, want) = step
             .split_once("=>")
             .map_or((step, None), |(c, w)| (c, Some(w.trim())));
+        let is_word = |v: &str| v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
         let (var, cmd) = cmd
             .split_once(" = ")
+            .filter(|(v, _)| is_word(v))
             .map_or((None, cmd), |(v, c)| (Some(v), c));
-        let words: Vec<&str> = cmd.split_whitespace().collect();
+        let mut words: Vec<&str> = cmd.split_whitespace().collect();
         if words[0] == "reopen" {
-            handle = None;
-            drop(fs);
-            fs = open_overlay(&base, &db).await;
-            continue;
+            (handle, fs) = (None, None);
+            words = vec!["openMerged", "db"];
         }
-        let got = run_step(&fs, &mut handle, &words).await;
+        let got = match words[0] {
+            "close" => {
+                (handle, fs) = (None, None);
+                Ok(String::new())
+            }
+            "openMerged" => {
+                let base = words.get(2).map(|b| root.join(b));
+                let opened = open_overlay(&root.join(words[1]), base.as_deref()).await;
+                opened.map(|o| {
+                    fs = Some(o);
+                    String::new()
+                })
+            }
+            "sql" | "legacyRust" | "plainDb" | "hostRead" | "hostWrite" | "hostRm"
+            | "hostMkdir" => run_aux(&root, &words).await,
+            _ => match &fs {
+                Some(fs) => run_step(fs, &mut handle, &words).await,
+                None => Err(Error::Internal("no overlay is open".into())),
+            },
+        };
         let out = got.as_ref().map_or_else(errno_name, |v| v.clone());
         let want = want.map(|w| {
             vars.iter()
