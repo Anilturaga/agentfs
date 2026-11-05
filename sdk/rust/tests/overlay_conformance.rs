@@ -1,13 +1,12 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-use agentfs_sdk::error::{Error, Result};
-use agentfs_sdk::*;
+use agentfs_sdk::{error::*, *};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 macro_rules! errnos {
     ($($name:ident),*) => { [$((stringify!($name), libc::$name)),*] };
@@ -81,12 +80,11 @@ async fn parent<'a>(fs: &OverlayFS, path: &'a str) -> Result<(i64, &'a str)> {
 }
 
 async fn slurp(file: &BoxedFile) -> Result<String> {
-    let data = file.pread(0, file.fstat().await?.size as u64).await?;
-    Ok(String::from_utf8_lossy(&data).into_owned())
+    let size = file.fstat().await?.size as u64;
+    Ok(String::from_utf8_lossy(&file.pread(0, size).await?).into())
 }
 
-/// Runs one step. Steps that the Rust SDK cannot serve yet (the management
-/// operations and `diff`) fail with `ENOSYS`.
+/// Runs one step. Steps the Rust SDK cannot serve yet (management operations, `diff`) fail with `ENOSYS`.
 async fn run_step(fs: &OverlayFS, h: &mut Option<BoxedFile>, w: &[&str]) -> Result<String> {
     let ino = |i, f| async move { Ok::<_, Error>(resolve(fs, w[i], f).await?.ino) };
     let mut out = String::new();
@@ -107,16 +105,14 @@ async fn run_step(fs: &OverlayFS, h: &mut Option<BoxedFile>, w: &[&str]) -> Resu
         }
         "read" => out = slurp(&fs.open(ino(1, true).await?, libc::O_RDONLY).await?).await?,
         "readlink" => out = fs.readlink(ino(1, false).await?).await?.unwrap_or_default(),
-        "hostRead" => out = std::fs::read_to_string(&w[1][1..])?,
         "hread" => out = slurp(h.as_ref().unwrap()).await?,
+        "hostRead" => out = std::fs::read_to_string(&w[1][1..])?,
         "open" => *h = Some(fs.open(ino(1, true).await?, libc::O_RDWR).await?),
         "write" => {
+            let (dir, name) = parent(fs, w[1]).await?;
             let file = match ino(1, true).await {
                 Ok(ino) => fs.open(ino, libc::O_RDWR).await?,
-                Err(_) => {
-                    let (dir, name) = parent(fs, w[1]).await?;
-                    fs.create_file(dir, name, 0o100644, 0, 0).await?.1
-                }
+                Err(_) => fs.create_file(dir, name, 0o100644, 0, 0).await?.1,
             };
             file.truncate(0).await?;
             file.pwrite(0, w[2].as_bytes()).await?;
@@ -144,8 +140,7 @@ async fn run_step(fs: &OverlayFS, h: &mut Option<BoxedFile>, w: &[&str]) -> Resu
     Ok(out)
 }
 
-/// `!x` needs a successful step whose result differs from `x`; any other
-/// expectation is compared to the result, or to the error name of a failed step.
+/// `!x` needs a successful step with a result other than `x`; else `want` is the result or error name.
 fn satisfied(want: Option<&str>, step_ok: bool, out: &str) -> bool {
     match want.map(|w| w.strip_prefix('!').ok_or(w)) {
         None => step_ok,
@@ -158,12 +153,12 @@ async fn run_steps(case: &Value, script: &str) -> std::result::Result<(), String
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("base");
     std::fs::create_dir(&base).unwrap();
-    let base = base.canonicalize().unwrap();
     std::env::set_current_dir(&base).unwrap();
-    Command::new("sh").args(["-c", script]).status().unwrap();
+    let setup = Command::new("sh").args(["-ec", script]).status().unwrap();
+    assert!(setup.success(), "base setup failed");
     let db = dir.path().join("overlay.db");
     let mut fs = open_overlay(&base, &db).await;
-    let (mut handle, mut vars) = (None, HashMap::<&str, String>::new());
+    let (mut handle, mut vars) = (None, Vec::<(&str, String)>::new());
     for step in case["steps"].as_array().unwrap() {
         let step = step.as_str().unwrap();
         let (cmd, want) = step
@@ -193,20 +188,26 @@ async fn run_steps(case: &Value, script: &str) -> std::result::Result<(), String
     Ok(())
 }
 
-/// Runs a case in a child process of this test binary. The child arms `SIGALRM`, so a
-/// hung case is killed by the kernel and leaves no worker behind.
-fn run_case(index: usize) -> std::result::Result<(), String> {
-    let exe = std::env::current_exe().unwrap();
-    let mut child = Command::new(exe);
-    child.args(["--exact", "overlay_conformance", "--nocapture"]);
-    let out = child
-        .env("CONFORMANCE_CASE", index.to_string())
-        .output()
-        .unwrap();
-    match out.status.signal() {
-        _ if out.status.success() => Ok(()),
-        Some(libc::SIGALRM) => Err("timed out".into()),
-        _ => Err(String::from_utf8_lossy(&out.stderr).trim().into()),
+/// Runs `cmd` in its own process group and kills the group at the deadline and after the
+/// child exits. Exit code 1 is a failed case; any other failure is a runner error.
+fn run_group(cmd: &mut Command, secs: u64) -> std::result::Result<(), String> {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    cmd.process_group(0).stdout(Stdio::null());
+    cmd.stderr(log.reopen().unwrap());
+    let mut child = cmd.spawn().unwrap();
+    let (deadline, mut status) = (Instant::now() + Duration::from_secs(secs), None);
+    while status.is_none() && Instant::now() < deadline {
+        status = child.try_wait().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    child.wait().unwrap();
+    let msg = std::fs::read_to_string(log.path()).unwrap();
+    match status.map(|s| s.code()) {
+        None => Err("timed out".into()),
+        Some(Some(0)) => Ok(()),
+        Some(Some(1)) => Err(msg.trim().into()),
+        _ => panic!("runner error: {}", msg.trim()),
     }
 }
 
@@ -215,7 +216,6 @@ fn overlay_conformance() {
     let doc: Value = serde_json::from_str(CASES).unwrap();
     if let Ok(id) = std::env::var("CONFORMANCE_CASE") {
         let case = &doc["cases"][id.parse::<usize>().unwrap()];
-        unsafe { libc::alarm(case["timeout"].as_u64().unwrap_or(30) as u32) };
         let rt = tokio::runtime::Runtime::new().unwrap();
         if let Err(e) = rt.block_on(run_steps(case, doc["base"].as_str().unwrap())) {
             eprintln!("{e}");
@@ -226,7 +226,11 @@ fn overlay_conformance() {
     let (mut pass, mut xfail, mut failures) = (0, Vec::new(), Vec::new());
     for (index, case) in doc["cases"].as_array().unwrap().iter().enumerate() {
         let (id, o) = (&case["id"], &case["xfail"]);
-        match (run_case(index), o.as_array().is_some_and(|a| !a.is_empty())) {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "overlay_conformance", "--nocapture"]);
+        let secs = case["timeout"].as_u64().unwrap_or(30);
+        let ran = run_group(cmd.env("CONFORMANCE_CASE", index.to_string()), secs);
+        match (ran, o.is_array()) {
             (Ok(()), false) => pass += 1,
             (Err(e), true) => xfail.push(format!("case {id} xfail {o}: {e}")),
             (Ok(()), true) => failures.push(format!("case {id} passes: remove xfail {o}")),
@@ -242,4 +246,15 @@ fn overlay_conformance() {
 fn inequality_needs_a_successful_step() {
     assert!(!satisfied(Some("!1"), false, "ENOENT"));
     assert!(satisfied(Some("!1"), true, "2"));
+}
+
+#[test]
+fn timeout_kills_the_whole_process_group() {
+    let marker = tempfile::NamedTempFile::new().unwrap();
+    let script = format!("(sleep 2; echo late > {}) & wait", marker.path().display());
+    let start = Instant::now();
+    let result = run_group(Command::new("sh").args(["-c", &script]), 1);
+    assert!(result == Err("timed out".into()) && start.elapsed() < Duration::from_secs(2));
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(std::fs::read(marker.path()).unwrap().is_empty());
 }
