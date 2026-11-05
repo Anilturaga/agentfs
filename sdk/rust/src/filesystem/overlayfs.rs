@@ -127,6 +127,39 @@ impl File for LowerHandle {
     }
 }
 
+/// A handle to a delta entry. `fstat` reports the merged inode, not the delta inode.
+struct DeltaHandle {
+    ino: i64,
+    file: BoxedFile,
+}
+
+#[async_trait]
+impl File for DeltaHandle {
+    async fn pread(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
+        self.file.pread(offset, size).await
+    }
+
+    async fn pwrite(&self, offset: u64, data: &[u8]) -> Result<()> {
+        self.file.pwrite(offset, data).await
+    }
+
+    async fn truncate(&self, size: u64) -> Result<()> {
+        self.file.truncate(size).await
+    }
+
+    async fn fsync(&self) -> Result<()> {
+        self.file.fsync().await
+    }
+
+    async fn fstat(&self) -> Result<Stats> {
+        let stats = self.file.fstat().await?;
+        Ok(Stats {
+            ino: self.ino,
+            ..stats
+        })
+    }
+}
+
 impl OverlayFS {
     /// Create a new overlay filesystem
     pub fn new(base: Arc<dyn FileSystem>, delta: AgentFS) -> Self {
@@ -1031,7 +1064,10 @@ impl FileSystem for OverlayFS {
         }
 
         match info.layer {
-            Layer::Delta => FileSystem::open(&self.delta, info.underlying_ino, flags).await,
+            Layer::Delta => {
+                let file = FileSystem::open(&self.delta, info.underlying_ino, flags).await?;
+                Ok(Arc::new(DeltaHandle { ino, file }))
+            }
             Layer::Base => {
                 let stats = self.base.getattr(info.underlying_ino).await?;
                 if stats.is_some_and(|s| is_special(&s)) {
@@ -1110,7 +1146,13 @@ impl FileSystem for OverlayFS {
         let overlay_ino = self.get_or_create_overlay_ino(Layer::Delta, stats.ino, &path);
         stats.ino = overlay_ino;
 
-        Ok((stats, file))
+        Ok((
+            stats,
+            Arc::new(DeltaHandle {
+                ino: overlay_ino,
+                file,
+            }),
+        ))
     }
 
     async fn mknod(
@@ -3202,6 +3244,40 @@ mod tests {
                 assert_eq!(mode_of(&overlay, d.ino, to).await?, mode);
             }
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_handles_report_the_merged_inode() -> Result<()> {
+        let base_dir = tempdir()?;
+        std::fs::create_dir_all(base_dir.path().join("d/sub"))?;
+        std::fs::write(base_dir.path().join("f"), b"f")?;
+        let delta_dir = tempdir()?;
+        let db = delta_dir.path().join("delta.db");
+
+        let overlay = open_overlay(base_dir.path(), &db).await?;
+        let f = overlay.lookup(ROOT_INO, "f").await?.unwrap();
+        overlay.chmod(f.ino, 0o600).await?;
+        let file = overlay.open(f.ino, libc::O_RDWR).await?;
+        assert_eq!(file.fstat().await?.ino, f.ino);
+        let (made, file) = overlay
+            .create_file(ROOT_INO, "n", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        assert_eq!(file.fstat().await?.ino, made.ino);
+
+        let overlay = open_overlay(base_dir.path(), &db).await?;
+        let d = overlay.lookup(ROOT_INO, "d").await?.unwrap();
+        overlay.lookup(d.ino, "sub").await?.unwrap();
+        for name in ["f", "n"] {
+            let stats = overlay.lookup(ROOT_INO, name).await?.unwrap();
+            let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+            assert_eq!(file.fstat().await?.ino, stats.ino);
+        }
+        let stats = overlay.lookup(ROOT_INO, "f").await?.unwrap();
+        let file = overlay.open(stats.ino, libc::O_RDWR).await?;
+        file.pwrite(0, b"g").await?;
+        assert_eq!(file.fstat().await?.ino, stats.ino);
 
         Ok(())
     }
