@@ -50,7 +50,7 @@ const fail = (code: FsErrorCode, syscall: FsSyscall, path?: string): never => {
 };
 const unsupported = (syscall: FsSyscall) => async (..._args: any[]): Promise<never> => fail('ENOSYS', syscall);
 const join = (dir: string, name: string) => `${dir === '/' ? '' : dir}/${name}`;
-const split = (path: string) => path.split('/').filter((c) => c && c !== '.').reverse();
+const split = (path: string) => path.split('/').filter((c, i, all) => c || (i > 0 && i === all.length - 1)).reverse();
 const isDir = (s?: { mode: number } | null) => !!s && (s.mode & S_IFMT) === S_IFDIR;
 const typeOf = (mode: number) => TYPES[mode & S_IFMT] ?? '?';
 
@@ -112,8 +112,7 @@ export class OverlayFS implements FileSystem {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    release(this.key);
-    await this.db.close();
+    await this.db.close().finally(() => release(this.key));
   }
 
   private cmp(a: string, b: string): number {
@@ -123,7 +122,7 @@ export class OverlayFS implements FileSystem {
   private async stats(e: Entry): Promise<Stats> {
     if (e.deltaIno === undefined) {
       const l = await this.lower.lstat(e.lowerPath!);
-      return l ? createStats({ ino: e.ino, ...l }) : fail('ENOENT', 'stat', e.lowerPath);
+      return l ? createStats({ ...l, ino: e.ino }) : fail('ENOENT', 'stat', e.lowerPath);
     }
     const row: StatsData | undefined = await this.db
       .prepare(`SELECT ${COLUMNS} FROM fs_inode i WHERE i.ino = ?`)
@@ -138,19 +137,6 @@ export class OverlayFS implements FileSystem {
     return this.B.from(await this.lower.read(e.lowerPath!, offset, size));
   }
 
-  private deltaNode(path: string, row: StatsData, lower?: LowerStats): Node {
-    const deltaIno = Number(row.ino);
-    let entry = this.byDelta.get(deltaIno);
-    if (!entry) this.byDelta.set(deltaIno, (entry = { ino: this.nextIno++, deltaIno }));
-    return { entry, path, lower, stats: createStats({ ...row, ino: entry.ino }) };
-  }
-
-  private lowerNode(path: string, lower: LowerStats): Node {
-    let entry = this.byLower.get(path);
-    if (!entry) this.byLower.set(path, (entry = { ino: this.nextIno++, lowerPath: path }));
-    return { entry, path, lower, stats: createStats({ ...lower, ino: entry.ino }) };
-  }
-
   private async child(dir: Node, name: string): Promise<Node | null> {
     const path = join(dir.path, name);
     // `dir.lower` is set only when no whiteout covers `dir`, so a whiteout at `path` is the only one to check.
@@ -159,9 +145,17 @@ export class OverlayFS implements FileSystem {
     if (dir.entry.deltaIno !== undefined) {
       const sql = `SELECT ${COLUMNS} FROM fs_dentry d JOIN fs_inode i ON i.ino = d.ino WHERE d.parent_ino = ? AND d.name = ?`;
       const row: StatsData | undefined = await this.db.prepare(sql).get(dir.entry.deltaIno, name);
-      if (row) return this.deltaNode(path, row, lower);
+      if (row) {
+        const deltaIno = Number(row.ino);
+        let entry = this.byDelta.get(deltaIno);
+        if (!entry) this.byDelta.set(deltaIno, (entry = { ino: this.nextIno++, deltaIno }));
+        return { entry, path, lower, stats: createStats({ ...row, ino: entry.ino }) };
+      }
     }
-    return lower ? this.lowerNode(path, lower) : null;
+    if (!lower) return null;
+    let entry = this.byLower.get(path);
+    if (!entry) this.byLower.set(path, (entry = { ino: this.nextIno++, lowerPath: path }));
+    return { entry, path, lower, stats: createStats({ ...lower, ino: entry.ino }) };
   }
 
   private async target(node: Node): Promise<string> {
@@ -177,15 +171,16 @@ export class OverlayFS implements FileSystem {
    * followed, the last one only if `followLast`. `node` is null when the last component is missing.
    */
   private async walk(path: string, followLast: boolean, syscall: FsSyscall) {
-    const stack = [await this.root()];
+    const root = this.byDelta.get(1)!;
+    const stack: Node[] = [{ entry: root, path: '/', lower: this.rootLower, stats: await this.stats(root) }];
     const parts = split(path);
     let node: Node | null = stack[0];
     let name = '';
     let links = 0;
     while (parts.length) {
       name = parts.pop()!;
-      if (name === '..') {
-        if (stack.length > 1) stack.pop();
+      if (name === '' || name === '.' || name === '..') {
+        if (name === '..' && stack.length > 1) stack.pop();
         node = stack[stack.length - 1];
         continue;
       }
@@ -204,11 +199,6 @@ export class OverlayFS implements FileSystem {
       }
     }
     return { parent: stack[stack.length - 1], name, node };
-  }
-
-  private async root(): Promise<Node> {
-    const entry = this.byDelta.get(1)!;
-    return { entry, path: '/', lower: this.rootLower, stats: await this.stats(entry) };
   }
 
   private async find(path: string, followLast: boolean, syscall: FsSyscall): Promise<Node> {
@@ -312,7 +302,6 @@ export class OverlayFS implements FileSystem {
    */
   async diff(): Promise<Change[]> {
     const changes = new Map<string, Change>();
-    const inDelta = new Set<string>();
     const hidden = new Set(this.whiteouts);
     const memo = new Map<string, Promise<LowerStats | null>>();
     const base = (path: string): Promise<LowerStats | null> => {
@@ -328,7 +317,6 @@ export class OverlayFS implements FileSystem {
       for (const r of await this.db.prepare(children).all(item[0])) {
         const path = join(item[1], r.name);
         const inBase = await base(path);
-        inDelta.add(path);
         changes.set(path, { change: inBase ? 'M' : 'A', type: typeOf(r.mode), path });
         if (isDir(r)) queue.push([Number(r.ino), path]);
         else if (isDir(inBase)) hidden.add(path);
@@ -337,7 +325,7 @@ export class OverlayFS implements FileSystem {
     const removed = async (path: string): Promise<void> => {
       const b = await base(path);
       if (!b) return;
-      if (!inDelta.has(path)) changes.set(path, { change: 'D', type: typeOf(b.mode), path });
+      if (!changes.has(path)) changes.set(path, { change: 'D', type: typeOf(b.mode), path });
       if (isDir(b)) for (const n of await this.lower.readdir(path)) await removed(join(path, n));
     };
     for (const path of hidden) await removed(path);
@@ -429,8 +417,7 @@ export async function openMerged(db: DatabasePromise, base: LowerAdapter, B = Bu
   try {
     return await mount(db, key, B, base);
   } catch (e) {
-    release(key);
-    await db.close();
+    await db.close().finally(() => release(key));
     throw e;
   }
 }

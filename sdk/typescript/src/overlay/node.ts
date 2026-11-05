@@ -83,8 +83,8 @@ export async function openMerged(dbPath: string, base?: string | LowerAdapter): 
     await db.connect();
     return await mount(db, key, Buffer, base === undefined ? undefined : await lowerOf(base), hostLower);
   } catch (e) {
-    release(key);
     await db.close().catch(() => {});
+    release(key);
     throw lockError(e);
   }
 }
