@@ -2,7 +2,7 @@ import type { DatabasePromise } from '@tursodatabase/database-common';
 import { createFsError, type FsErrorCode, type FsSyscall } from '../errors.js';
 import { AgentFS, AgentFSFile } from '../filesystem/agentfs.js';
 import {
-  S_IFMT, S_IFREG, S_IFDIR, S_IFLNK, createStats,
+  S_IFMT, S_IFREG, S_IFDIR, S_IFLNK, DEFAULT_FILE_MODE, DEFAULT_DIR_MODE, createStats,
   type DirEntry, type FileHandle, type FileSystem, type FilesystemStats, type Stats, type StatsData,
 } from '../filesystem/interface.js';
 
@@ -48,11 +48,13 @@ const TYPES: Record<number, Change['type']> = { [S_IFREG]: 'f', [S_IFDIR]: 'd', 
 const fail = (code: FsErrorCode, syscall: FsSyscall, path?: string): never => {
   throw createFsError({ code, syscall, path });
 };
-const unsupported = (syscall: FsSyscall) => async (..._args: any[]): Promise<never> => fail('ENOSYS', syscall);
 const join = (dir: string, name: string) => `${dir === '/' ? '' : dir}/${name}`;
 const split = (path: string) => path.split('/').filter((c, i, all) => c || (i > 0 && i === all.length - 1)).reverse();
 const isDir = (s?: { mode: number } | null) => !!s && (s.mode & S_IFMT) === S_IFDIR;
 const typeOf = (mode: number) => TYPES[mode & S_IFMT] ?? '?';
+const copyable = (mode: number) => (mode & S_IFMT) in TYPES;
+const parentOf = (path: string) => path.slice(0, path.lastIndexOf('/')) || '/';
+const now = () => Math.floor(Date.now() / 1000);
 
 /**
  * An unclosed statement keeps the database file locked after `db.close()`. This wrapper closes
@@ -276,25 +278,178 @@ export class OverlayFS implements FileSystem {
 
   async open(path: string): Promise<FileHandle> {
     const { entry } = await this.file(path);
+    const file = async (withContent = true) =>
+      new AgentFSFile(this.db, this.B, await this.writable(entry, withContent), this.delta.getChunkSize());
     return {
       pread: (offset, size) => this.pread(entry, offset, size),
       fstat: () => this.stats(entry),
       fsync: async () => {},
-      pwrite: unsupported('open'),
-      truncate: unsupported('open'),
+      pwrite: async (offset, data) => (await file()).pwrite(offset, data),
+      truncate: async (size) => (await file(size > 0)).truncate(size),
     };
   }
 
-  writeFile: FileSystem['writeFile'] = unsupported('open');
-  mkdir: FileSystem['mkdir'] = unsupported('mkdir');
-  rmdir: FileSystem['rmdir'] = unsupported('rmdir');
-  unlink: FileSystem['unlink'] = unsupported('unlink');
-  rm: FileSystem['rm'] = unsupported('rm');
-  rename: FileSystem['rename'] = unsupported('rename');
-  copyFile: FileSystem['copyFile'] = unsupported('copyfile');
-  symlink: FileSystem['symlink'] = unsupported('open');
-  chmod: (path: string, mode: number) => Promise<void> = unsupported('chmod');
-  link: (existingPath: string, newPath: string) => Promise<void> = unsupported('link');
+  /** Copies a lower-backed entry and its lower-backed ancestors, top-down, into the delta. */
+  private async copyUp(node: Node, withContent = true): Promise<number> {
+    if (node.entry.deltaIno !== undefined) return node.entry.deltaIno;
+    const l = node.lower!;
+    if (!copyable(l.mode)) fail('ENOTSUP', 'open', node.path);
+    const parentIno = await this.copyUp(await this.find(parentOf(node.path), true, 'open'));
+    const ino = await this.delta.createInode(l.mode, l.uid, l.gid);
+    if ((l.mode & S_IFMT) === S_IFLNK) await this.writeLink(ino, await this.lower.readlink(node.path));
+    else if ((l.mode & S_IFMT) === S_IFREG && withContent && l.size > 0) {
+      const data = this.B.from(await this.lower.read(node.path, 0, l.size));
+      await new AgentFSFile(this.db, this.B, ino, this.delta.getChunkSize()).pwrite(0, data);
+    }
+    await this.delta.createDentry(parentIno, node.path.slice(node.path.lastIndexOf('/') + 1), ino);
+    await this.db.prepare('INSERT INTO fs_origin (delta_ino, lower_path) VALUES (?, ?)').run(ino, node.path);
+    this.byLower.delete(node.path);
+    this.byDelta.set(ino, node.entry);
+    node.entry.deltaIno = ino;
+    return ino;
+  }
+
+  /** Inserts a whiteout if the base resolves `node` and no whiteout covers it. */
+  private async hide(node: Node | null): Promise<void> {
+    if (!node?.lower) return;
+    await this.db.prepare('INSERT INTO fs_whiteout (path, created_at) VALUES (?, ?)').run(node.path, now());
+    this.whiteouts.add(node.path);
+  }
+
+  private async writeLink(ino: number, target: string): Promise<void> {
+    await this.db.prepare('INSERT INTO fs_symlink (ino, target) VALUES (?, ?)').run(ino, target);
+    await this.db.prepare('UPDATE fs_inode SET size = ? WHERE ino = ?').run(target.length, ino);
+  }
+
+  private async add(parent: Node, name: string, mode: number): Promise<number> {
+    const ino = await this.delta.createInode(mode);
+    await this.delta.createDentry(await this.copyUp(parent), name, ino);
+    return ino;
+  }
+
+  /** Resolves an existing entry that is not the root, without following a final symlink. */
+  private async locate(path: string, syscall: FsSyscall) {
+    const { parent, name, node } = await this.walk(path, false, syscall);
+    const found = node ?? fail('ENOENT', syscall, path);
+    if (found.path === '/') fail('EPERM', syscall, path);
+    return { parent, name, node: found };
+  }
+
+  private async remove({ parent, name, node }: { parent: Node; name: string; node: Node }): Promise<void> {
+    if (node.entry.deltaIno !== undefined) {
+      await this.delta.removeDentryAndMaybeInode(parent.entry.deltaIno!, name, node.entry.deltaIno);
+    }
+    await this.hide(node);
+  }
+
+  /** The delta inode of a handle's entry. A lower-backed entry is copied up unless it was removed or replaced. */
+  private async writable(entry: Entry, withContent: boolean): Promise<number> {
+    if (entry.deltaIno !== undefined) return entry.deltaIno;
+    const { node } = await this.walk(entry.lowerPath!, false, 'open');
+    return node?.entry === entry ? this.copyUp(node, withContent) : fail('ENOENT', 'open', entry.lowerPath);
+  }
+
+  private async subtree(node: Node): Promise<Node[]> {
+    const nodes = [node];
+    if (isDir(node.stats)) {
+      for (const name of await this.names(node)) nodes.push(...(await this.subtree((await this.child(node, name))!)));
+    }
+    return nodes;
+  }
+
+  async writeFile(path: string, data: string | Buffer, options?: BufferEncoding | { encoding?: BufferEncoding }) {
+    const content = typeof data === 'string' ? this.B.from(data, typeof options === 'string' ? options : options?.encoding) : data;
+    const dirs = path.split('/').filter(Boolean).slice(0, -1);
+    for (let i = 1; i <= dirs.length; i++) {
+      const dir = '/' + dirs.slice(0, i).join('/');
+      if (!(await this.walk(dir, true, 'open')).node) await this.mkdir(dir);
+    }
+    const { parent, name, node } = await this.walk(path, true, 'open');
+    if (node && isDir(node.stats)) fail('EISDIR', 'open', path);
+    const ino = node ? await this.copyUp(node, false) : await this.add(parent, name, DEFAULT_FILE_MODE);
+    const file = new AgentFSFile(this.db, this.B, ino, this.delta.getChunkSize());
+    await file.truncate(0);
+    await file.pwrite(0, content);
+  }
+
+  async mkdir(path: string): Promise<void> {
+    const { parent, name, node } = await this.walk(path, false, 'mkdir');
+    if (node) fail('EEXIST', 'mkdir', path);
+    await this.add(parent, name, DEFAULT_DIR_MODE);
+  }
+
+  async symlink(target: string, path: string): Promise<void> {
+    const { parent, name, node } = await this.walk(path, false, 'open');
+    if (node) fail('EEXIST', 'open', path);
+    await this.writeLink(await this.add(parent, name, S_IFLNK | 0o777), target);
+  }
+
+  async unlink(path: string): Promise<void> {
+    const found = await this.locate(path, 'unlink');
+    if (isDir(found.node.stats)) fail('EISDIR', 'unlink', path);
+    await this.remove(found);
+  }
+
+  async rmdir(path: string): Promise<void> {
+    const found = await this.locate(path, 'rmdir');
+    if (!isDir(found.node.stats)) fail('ENOTDIR', 'rmdir', path);
+    if ((await this.names(found.node)).length) fail('ENOTEMPTY', 'rmdir', path);
+    await this.remove(found);
+  }
+
+  async rm(path: string, options?: { force?: boolean; recursive?: boolean }): Promise<void> {
+    const walked = await this.walk(path, false, 'rm').catch((e) => (options?.force && e.code === 'ENOENT' ? null : Promise.reject(e)));
+    const node = walked?.node;
+    if (!node) return options?.force ? undefined : fail('ENOENT', 'rm', path);
+    if (node.path === '/') fail('EPERM', 'rm', path);
+    if (!isDir(node.stats)) return this.unlink(path);
+    if (!options?.recursive) fail('EISDIR', 'rm', path);
+    for (const name of await this.names(node)) await this.rm(join(node.path, name), { recursive: true });
+    await this.rmdir(node.path);
+  }
+
+  async chmod(path: string, mode: number): Promise<void> {
+    const ino = await this.copyUp(await this.find(path, true, 'chmod'));
+    await this.db.prepare('UPDATE fs_inode SET mode = (mode & ?) | ?, ctime = ? WHERE ino = ?').run(S_IFMT, mode & 0o7777, now(), ino);
+  }
+
+  async link(existingPath: string, newPath: string): Promise<void> {
+    const { node } = await this.locate(existingPath, 'link');
+    if (isDir(node.stats)) fail('EPERM', 'link', existingPath);
+    const ino = node.entry.deltaIno ?? fail('EXDEV', 'link', existingPath);
+    const { parent, name, node: existing } = await this.walk(newPath, false, 'link');
+    if (existing) fail('EEXIST', 'link', newPath);
+    await this.delta.createDentry(await this.copyUp(parent), name, ino);
+  }
+
+  async rename(oldPath: string, newPath: string): Promise<void> {
+    const src = await this.locate(oldPath, 'rename');
+    const dst = await this.walk(newPath, false, 'rename');
+    const dstPath = dst.node?.path ?? join(dst.parent.path, dst.name);
+    const srcDelta = src.node.entry.deltaIno;
+    if (src.node.path === dstPath || (srcDelta !== undefined && srcDelta === dst.node?.entry.deltaIno)) return;
+    const srcIsDir = isDir(src.node.stats);
+    if (srcIsDir && dstPath.startsWith(src.node.path + '/')) fail('EINVAL', 'rename', newPath);
+    if (dst.node) {
+      if (isDir(dst.node.stats) !== srcIsDir) fail(srcIsDir ? 'ENOTDIR' : 'EISDIR', 'rename', newPath);
+      if (srcIsDir && (await this.names(dst.node)).length) fail('ENOTEMPTY', 'rename', newPath);
+    }
+    const tree = await this.subtree(src.node);
+    for (const n of tree) if (n.lower && n.entry.deltaIno === undefined && !copyable(n.lower.mode)) fail('ENOTSUP', 'rename', n.path);
+    for (const n of tree) await this.copyUp(n);
+    const dstParentIno = await this.copyUp(dst.parent);
+    const dstDelta = dst.node?.entry.deltaIno;
+    if (dstDelta !== undefined) await this.delta.removeDentryAndMaybeInode(dstParentIno, dst.name, dstDelta);
+    const move = 'UPDATE fs_dentry SET parent_ino = ?, name = ? WHERE parent_ino = ? AND name = ?';
+    await this.db.prepare(move).run(dstParentIno, dst.name, src.parent.entry.deltaIno, src.name);
+    await this.hide(src.node);
+    await this.hide(dst.node);
+  }
+
+  async copyFile(src: string, dest: string): Promise<void> {
+    await this.writeFile(dest, await this.readFile(src));
+    await this.chmod(dest, (await this.stat(src)).mode);
+  }
 
   /**
    * Compares the merged tree with the base tree without reading the whole base: it walks the
@@ -306,7 +461,7 @@ export class OverlayFS implements FileSystem {
     const memo = new Map<string, Promise<LowerStats | null>>();
     const base = (path: string): Promise<LowerStats | null> => {
       if (!memo.has(path)) {
-        const parent = path === '/' ? Promise.resolve({ mode: S_IFDIR }) : base(path.slice(0, path.lastIndexOf('/')) || '/');
+        const parent = path === '/' ? Promise.resolve({ mode: S_IFDIR }) : base(parentOf(path));
         memo.set(path, parent.then((p) => (isDir(p) ? this.lower.lstat(path) : null)));
       }
       return memo.get(path)!;

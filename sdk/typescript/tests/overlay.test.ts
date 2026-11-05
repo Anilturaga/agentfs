@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Database } from '@tursodatabase/database';
 import { execFileSync, execFile } from 'node:child_process';
-import { linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -79,7 +79,6 @@ describe('OverlayFS read path', () => {
     const h = await overlay.open('/d/x');
     expect((await h.pread(0, 10)).toString()).toBe('x');
     expect((await h.fstat()).ino).toBe((await overlay.stat('/d/x')).ino);
-    expect(await code(h.pwrite(0, Buffer.from('y')))).toBe('ENOSYS');
     expect((await overlay.stat('/')).ino).toBe(1);
     for (const e of await overlay.readdirPlus('/')) expect(e.stats.ino).toBe((await overlay.lstat(`/${e.name}`)).ino);
     expect(await Promise.all(rows.map((t) => count(db, t)))).toEqual(before);
@@ -190,6 +189,106 @@ describe('OverlayFS read path', () => {
     await overlay.close();
     overlay = await openMerged(db);
     await check(overlay);
+  });
+
+  describe('writes', () => {
+    const text = async (o: OverlayFS) => (await o.diff()).map((c) => `${c.change} ${c.type} ${c.path}`).join('; ');
+
+    it('copies up on the first write through a handle and keeps identity, mode and base', async () => {
+      chmodSync(join(base, 'f'), 0o600);
+      overlay = await openMerged(db, base);
+      const ino = (await overlay.stat('/f')).ino;
+      const h = await overlay.open('/f');
+      await h.pwrite(0, Buffer.from('B'));
+      expect((await h.pread(0, 10)).toString()).toBe('Base');
+      expect(await overlay.readFile('/f', 'utf8')).toBe('Base');
+      const after = await overlay.stat('/f');
+      expect([after.ino, after.mode & 0o7777]).toEqual([ino, 0o600]);
+      expect(readFileSync(join(base, 'f'), 'utf8')).toBe('base');
+      await h.truncate(0);
+      expect(await overlay.readFile('/f', 'utf8')).toBe('');
+      expect(await text(overlay)).toBe('M f /f');
+      await overlay.close();
+      const origins = new Database(db);
+      await origins.connect();
+      expect(await origins.prepare('SELECT lower_path FROM fs_origin').all()).toEqual([{ lower_path: '/f' }]);
+      await origins.close();
+      overlay = undefined;
+    });
+
+    it('fails a handle write after its entry was removed or replaced', async () => {
+      overlay = await openMerged(db, base);
+      const [gone, replaced] = [await overlay.open('/f'), await overlay.open('/d/x')];
+      await overlay.unlink('/f');
+      expect(await code(gone.pwrite(0, Buffer.from('z')))).toBe('ENOENT');
+      await overlay.unlink('/d/x');
+      await overlay.writeFile('/d/x', 'new');
+      expect(await code(replaced.truncate(0))).toBe('ENOENT');
+      expect(await overlay.readFile('/d/x', 'utf8')).toBe('new');
+      expect(readFileSync(join(base, 'f'), 'utf8')).toBe('base');
+    });
+
+    it('diffs a write into a large base without reading it', async () => {
+      mkdirSync(join(base, 'big'));
+      for (let i = 0; i < 10000; i++) writeFileSync(join(base, 'big', `f${i}`), '');
+      const host = await hostLower(base);
+      let names = 0;
+      overlay = await openMerged(db, { ...host, readdir: async (p) => (names += (await host.readdir(p)).length, host.readdir(p)) });
+      await overlay.writeFile('/big/f1', 'x');
+      expect(await text(overlay)).toBe('M d /big; M f /big/f1');
+      expect(names).toBeLessThan(100);
+    });
+
+    it('creates missing parents, removes trees, and copies files with their mode', async () => {
+      chmodSync(join(base, 'f'), 0o600);
+      overlay = await openMerged(db, base);
+      await overlay.writeFile('/n/a/b', 'x');
+      expect(await overlay.readdir('/n/a')).toEqual(['b']);
+      await overlay.copyFile('/f', '/n/copy');
+      expect([await overlay.readFile('/n/copy', 'utf8'), (await overlay.stat('/n/copy')).mode & 0o7777]).toEqual(['base', 0o600]);
+      expect(await code(overlay.rm('/d'))).toBe('EISDIR');
+      await overlay.rm('/d', { recursive: true });
+      await overlay.rm('/nope', { force: true });
+      expect(await code(overlay.rm('/nope'))).toBe('ENOENT');
+      expect(await overlay.readdir('/')).toEqual(['e', 'f', 'l', 'n', 'p']);
+      expect(await text(overlay)).toBe(
+        'D d /d; D d /d/sub; D f /d/sub/y; D f /d/x; A d /n; A d /n/a; A f /n/a/b; A f /n/copy'
+      );
+    });
+
+    it('links delta files, refuses lower sources, and keeps the data until the last link goes', async () => {
+      overlay = await openMerged(db, base);
+      expect(await code(overlay.link('/f', '/f2'))).toBe('EXDEV');
+      await overlay.writeFile('/n', '1');
+      await overlay.link('/n', '/n2');
+      expect([(await overlay.stat('/n')).ino, (await overlay.stat('/n')).nlink]).toEqual([(await overlay.stat('/n2')).ino, 2]);
+      await overlay.unlink('/n');
+      expect(await overlay.readFile('/n2', 'utf8')).toBe('1');
+    });
+
+    it('moves a base directory and keeps the result across a reopen', async () => {
+      overlay = await openMerged(db, base);
+      await overlay.rename('/d', '/m');
+      await overlay.symlink('m/x', '/s');
+      await overlay.chmod('/e', 0o700);
+      const before = await text(overlay);
+      await overlay.close();
+      overlay = await openMerged(db);
+      expect(await text(overlay)).toBe(before);
+      expect(await overlay.readFile('/m/sub/y', 'utf8')).toBe('y');
+      expect(await overlay.readFile('/s', 'utf8')).toBe('x');
+      expect(await code(overlay.stat('/d'))).toBe('ENOENT');
+      expect((await overlay.stat('/e')).mode & 0o7777).toBe(0o700);
+    });
+
+    it('refuses to copy up a lower FIFO and changes nothing', async () => {
+      execFileSync('mkfifo', [join(base, 'd', 'fifo')]);
+      overlay = await openMerged(db, base);
+      expect(await code(overlay.rename('/d', '/m'))).toBe('ENOTSUP');
+      expect(await code(overlay.chmod('/p', 0o600))).toBe('ENOTSUP');
+      expect(await overlay.readdir('/')).toEqual(['d', 'e', 'f', 'l', 'p']);
+      expect(await text(overlay)).toBe('');
+    });
   });
 
   describe('writer lock', () => {
