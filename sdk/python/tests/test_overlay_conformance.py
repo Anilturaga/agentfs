@@ -5,6 +5,7 @@ Worker exit codes: 0 every step matched, 1 a step result did not match, 2 harnes
 """
 
 import asyncio
+import errno
 import gc
 import json
 import os
@@ -14,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -185,8 +187,8 @@ class Worker:
             if op is None:
                 raise enosys()
             out, ok = await op(*words[1:]), True
-        except Exception as e:
-            out, ok = getattr(e, "code", None) or str(e), False
+        except OSError as e:
+            out, ok = getattr(e, "code", None) or errno.errorcode[e.errno], False
         name = bound.group(1) if bound else None
         return name, "" if out is None else str(out), ok, (want.strip() if arrow else None)
 
@@ -228,27 +230,22 @@ class CaseFailure(AssertionError):
     """A step result did not match."""
 
 
-def run_worker(index: int, seconds: int) -> subprocess.CompletedProcess:
-    """Runs a worker in its own session; kills the process group at the deadline and after exit."""
-    proc = subprocess.Popen(
-        [sys.executable, __file__, str(index)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        _, stderr = proc.communicate(timeout=seconds)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.communicate()
-        raise RuntimeError(f"timed out after {seconds}s") from None
-    finally:
+def run_group(cmd: list[str], seconds: int) -> tuple[int, str]:
+    """Runs `cmd` in its own session and kills the process group as soon as it exits."""
+    with tempfile.TemporaryFile("w+") as log:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=log, start_new_session=True)
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    return subprocess.CompletedProcess(proc.args, proc.returncode, stderr=stderr)
+            returncode = proc.wait(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"timed out after {seconds}s") from None
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        log.seek(0)
+        return returncode, log.read()
 
 
 def param(index: int, case: dict):
@@ -263,11 +260,27 @@ def param(index: int, case: dict):
     "index,seconds", [param(i, c) for i, c in enumerate(json.loads(CASES.read_text())["cases"])]
 )
 def test_case(index: int, seconds: int) -> None:
-    result = run_worker(index, seconds)
-    if result.returncode == 1:
-        raise CaseFailure(result.stderr)
-    if result.returncode != 0:
-        raise RuntimeError(f"runner error (exit {result.returncode}): {result.stderr}")
+    code, stderr = run_group([sys.executable, __file__, str(index)], seconds)
+    if code == 1:
+        raise CaseFailure(stderr)
+    if code != 0:
+        raise RuntimeError(f"runner error (exit {code}): {stderr}")
+
+
+async def test_worker_names_os_errors_and_raises_harness_errors(tmp_path):
+    worker = Worker(tmp_path)
+    (tmp_path / "base").mkdir()
+    assert await worker.step("hostRead /missing => ENOENT") == (None, "ENOENT", False, "ENOENT")
+    with pytest.raises(TypeError):
+        await worker.step("hostRead")
+
+
+def test_run_group_kills_descendants_that_hold_stderr_open():
+    start = time.monotonic()
+    assert run_group(["sh", "-c", "sleep 30 & exit 0"], 10) == (0, "")
+    assert time.monotonic() - start < 5
+    with pytest.raises(RuntimeError, match="timed out"):
+        run_group(["sleep", "30"], 1)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 import errno
 import gc
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -296,3 +297,55 @@ async def test_non_v1_databases_are_not_migrated(tmp_path, base, overlay):
     assert excinfo.value.code == "ENOTSUP"
     tables = await rows(go, "SELECT name FROM sqlite_master WHERE name = 'fs_overlay_config'")
     assert tables == []
+
+
+class DeniedAdapter:
+    """Wraps a HostAdapter and refuses `lstat` of one path, like an unsearchable directory."""
+
+    def __init__(self, inner: HostAdapter, denied: str) -> None:
+        self.inner = inner
+        self.locator = inner.locator
+        self.denied = denied
+
+    async def lstat(self, path):
+        if path == self.denied:
+            raise PermissionError(errno.EACCES, "denied", path)
+        return await self.inner.lstat(path)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+async def test_delta_file_is_found_without_probing_the_base(overlay, base):
+    async def seed(conn):
+        await (await Filesystem.from_database(conn)).write_file("/d/x", "delta")
+
+    await raw(overlay, seed)
+    denied = DeniedAdapter(HostAdapter(base), "/d/x")
+    async with await open_merged(overlay, denied) as fs:
+        assert await fs.read_file("/d/x") == "delta"
+
+
+async def test_diff_handles_deep_hidden_trees(tmp_path, overlay, base):
+    path = base / "deep"
+    for _ in range(1201):
+        path.mkdir()
+        path = path / "a"
+    await raw(overlay, lambda c: c.execute("INSERT INTO fs_whiteout VALUES ('/deep', 0)"))
+    async with await open_merged(overlay, base) as fs:
+        changes = await fs.diff()
+    assert len(changes) == 1201
+    assert str(changes[0]) == "D d /deep"
+
+
+async def test_host_adapter_reports_access_errors(tmp_path, monkeypatch):
+    real_stat = os.stat
+
+    def deny(path, *args, **kwargs):
+        if str(path) == str(tmp_path.resolve()):
+            raise PermissionError(errno.EACCES, "denied", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", deny)
+    with pytest.raises(PermissionError):
+        HostAdapter(tmp_path)

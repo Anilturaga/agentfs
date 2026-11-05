@@ -18,7 +18,6 @@ from .filesystem import Filesystem, Stats
 
 DbPath = str | os.PathLike[str]
 
-_MAX_LINKS = 40
 _COLS = "i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime"
 _TYPES = {S_IFREG: "f", S_IFDIR: "d", S_IFLNK: "l"}
 _SCHEMA = (
@@ -65,8 +64,12 @@ class HostAdapter:
 
     def __init__(self, root: str | os.PathLike[str]) -> None:
         self.locator = os.path.realpath(root)
-        if not os.path.isdir(self.locator):
-            _fail("ENOTDIR" if os.path.exists(self.locator) else "ENOENT", "stat", self.locator)
+        try:
+            mode = os.stat(self.locator).st_mode
+        except FileNotFoundError:
+            _fail("ENOENT", "stat", self.locator)
+        if mode & S_IFMT != S_IFDIR:
+            _fail("ENOTDIR", "stat", self.locator)
 
     async def identity(self) -> str:
         st = os.stat(self.locator)
@@ -168,9 +171,8 @@ class _Lock:
             del db
             traceback.clear_frames(sys.exc_info()[2])
             gc.collect()
-            if self.key is not None:
-                _held.discard(self.key)
-                self.key = None
+            _held.discard(self.key)
+            self.key = None
 
 
 class OverlayFile:
@@ -224,9 +226,7 @@ class OverlayFS:
 
     async def _child(self, parent: _Node, name: str) -> _Node | None:
         path = _join(parent.path, name)
-        lower = None
-        if _is_dir(parent.lower) and path not in self._whiteouts:
-            lower = await self._lower.lstat(path)
+        visible = _is_dir(parent.lower) and path not in self._whiteouts
         if parent.delta is not None:
             sql = f"SELECT {_COLS} FROM fs_dentry d JOIN fs_inode i ON i.ino = d.ino"
             rows = await _q(
@@ -234,8 +234,10 @@ class OverlayFS:
             )
             if rows:
                 stats = Stats(*rows[0])
+                lower = await self._lower.lstat(path) if visible and stats.is_directory() else None
                 ino = self._by_delta.setdefault(stats.ino, next(self._inos))
                 return _Node(ino, path, replace(stats, ino=ino), stats.ino, lower)
+        lower = await self._lower.lstat(path) if visible else None
         if lower is None:
             return None
         ino = self._by_lower.setdefault(path, next(self._inos))
@@ -264,7 +266,7 @@ class OverlayFS:
                 break
             if node.stats.is_symbolic_link() and (parts or follow_last):
                 links += 1
-                if links > _MAX_LINKS:
+                if links > 40:
                     _fail("ELOOP", syscall, path)
                 target = await self._target(node)
                 if target.startswith("/"):
@@ -279,10 +281,8 @@ class OverlayFS:
 
     async def _file(self, path: str) -> _Node:
         node = await self._find(path, True, "open")
-        if node.stats.is_directory():
-            _fail("EISDIR", "open", path)
         if not node.stats.is_file():
-            _fail("ENOTSUP", "open", path)
+            _fail("EISDIR" if node.stats.is_directory() else "ENOTSUP", "open", path)
         return node
 
     async def _dir(self, path: str) -> _Node:
@@ -333,21 +333,17 @@ class OverlayFS:
     async def diff(self) -> list[Change]:
         """Merged tree vs base, walking only what a delta entry or whiteout hides."""
         changes: dict[str, Change] = {}
-        hidden = set(self._whiteouts)
+        hidden = list(self._whiteouts)
         memo = {"/": self._root.lower}
 
         async def base(path: str) -> Stats | None:
-            if path not in memo:
-                parent = await base(path.rsplit("/", 1)[0] or "/")
-                memo[path] = await self._lower.lstat(path) if _is_dir(parent) else None
+            chain = [path]
+            while chain[-1] not in memo:
+                chain.append(chain[-1].rsplit("/", 1)[0] or "/")
+            for p in reversed(chain[:-1]):
+                parent = memo[p.rsplit("/", 1)[0] or "/"]
+                memo[p] = await self._lower.lstat(p) if _is_dir(parent) else None
             return memo[path]
-
-        async def removed(path: str) -> None:
-            if stats := await base(path):
-                changes.setdefault(path, Change("D", _TYPES.get(stats.mode & S_IFMT, "?"), path))
-                if stats.is_directory():
-                    for name in await self._lower.readdir(path):
-                        await removed(_join(path, name))
 
         sql = "SELECT d.name, i.ino, i.mode FROM fs_dentry d JOIN fs_inode i ON i.ino = d.ino"
         queue = [(1, "/")]
@@ -360,9 +356,13 @@ class OverlayFS:
                 if mode & S_IFMT == S_IFDIR:
                     queue.append((child, path))
                 elif _is_dir(lower):
-                    hidden.add(path)
-        for path in hidden:
-            await removed(path)
+                    hidden.append(path)
+        while hidden:
+            path = hidden.pop()
+            if stats := await base(path):
+                changes.setdefault(path, Change("D", _TYPES.get(stats.mode & S_IFMT, "?"), path))
+                if stats.is_directory():
+                    hidden.extend(_join(path, n) for n in await self._lower.readdir(path))
         return sorted(changes.values(), key=lambda c: c.path.encode())
 
 
