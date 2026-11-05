@@ -15,6 +15,7 @@ import {
   DEFAULT_FILE_MODE,
   DEFAULT_DIR_MODE,
   createStats,
+  fillFromChunks,
   type Stats,
   type DirEntry,
   type FilesystemStats,
@@ -88,37 +89,26 @@ class AgentFSFile implements FileHandle {
   }
 
   async pread(offset: number, size: number): Promise<Buffer> {
-    const startChunk = Math.floor(offset / this.chunkSize);
-    const endChunk = Math.floor((offset + size - 1) / this.chunkSize);
+    const sizeRow = this.storage.sql.exec<{ size: number }>(
+      'SELECT size FROM fs_inode WHERE ino = ?',
+      this.ino
+    ).toArray()[0];
+    const length = Math.max(0, Math.min(size, (sizeRow?.size ?? 0) - offset));
+    const out = Buffer.alloc(length);
+    if (length === 0) {
+      return out;
+    }
 
     const rows = this.storage.sql.exec<{ chunk_index: number; data: ArrayBuffer }>(
       `SELECT chunk_index, data FROM fs_data
-       WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ?
-       ORDER BY chunk_index ASC`,
-      this.ino, startChunk, endChunk
+       WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ?`,
+      this.ino,
+      Math.floor(offset / this.chunkSize),
+      Math.floor((offset + length - 1) / this.chunkSize)
     ).toArray();
 
-    const buffers: Buffer[] = [];
-    let bytesCollected = 0;
-    const startOffsetInChunk = offset % this.chunkSize;
-
-    for (const row of rows) {
-      const data = Buffer.from(row.data);
-      const skip = buffers.length === 0 ? startOffsetInChunk : 0;
-      if (skip >= data.length) {
-        continue;
-      }
-      const remaining = size - bytesCollected;
-      const take = Math.min(data.length - skip, remaining);
-      buffers.push(data.subarray(skip, skip + take));
-      bytesCollected += take;
-    }
-
-    if (buffers.length === 0) {
-      return Buffer.alloc(0);
-    }
-
-    return Buffer.concat(buffers);
+    fillFromChunks(out, offset, this.chunkSize, rows.map(r => ({ ...r, data: new Uint8Array(r.data) })));
+    return out;
   }
 
   async pwrite(offset: number, data: Buffer): Promise<void> {
@@ -653,18 +643,17 @@ export class AgentFS implements FileSystem {
       });
     }
 
-    const rows = this.storage.sql.exec<{ data: ArrayBuffer }>(
-      'SELECT data FROM fs_data WHERE ino = ? ORDER BY chunk_index ASC',
+    const { size } = this.storage.sql.exec<{ size: number }>(
+      'SELECT size FROM fs_inode WHERE ino = ?',
+      ino
+    ).one();
+    const rows = this.storage.sql.exec<{ chunk_index: number; data: ArrayBuffer }>(
+      'SELECT chunk_index, data FROM fs_data WHERE ino = ?',
       ino
     ).toArray();
 
-    let combined: Buffer;
-    if (rows.length === 0) {
-      combined = Buffer.alloc(0);
-    } else {
-      const buffers = rows.map(row => Buffer.from(row.data));
-      combined = Buffer.concat(buffers);
-    }
+    const combined = Buffer.alloc(size);
+    fillFromChunks(combined, 0, this.chunkSize, rows.map(r => ({ ...r, data: new Uint8Array(r.data) })));
 
     const now = Math.floor(Date.now() / 1000);
     this.storage.sql.exec('UPDATE fs_inode SET atime = ? WHERE ino = ?', now, ino);
