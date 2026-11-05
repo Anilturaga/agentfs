@@ -15,14 +15,14 @@ Branch `overlay/main` is the integration trunk for bringing overlay management t
 - Report `git diff --numstat` against the base, split into source and tests/fixtures, in every PR.
 
 ## Toolchains (already installed in the Warp environment)
-- Rust: `nightly-2026-03-01`. The latest nightly breaks the `branches` crate, so don't change the toolchain.
+- Rust: `nightly-2026-03-01`. **Prefix every Rust command with `RUSTUP_TOOLCHAIN=nightly-2026-03-01`.** `cli/rust-toolchain.toml` floats on `nightly`, and the latest nightly breaks the `branches` crate.
 - Node 24 + npm, Python ≥3.10 + uv, Go (apt), pkg-config, libssl, libunwind. There's no FUSE, so mount tests can't run here.
 
 ## Checks to run for each component you touch (run the full suite, not just new tests)
 | Component | Commands |
 |---|---|
-| `sdk/rust` | `cargo fmt --check && cargo clippy -- -D warnings && cargo test` |
-| `cli` | `cargo fmt --check && cargo clippy -- -D warnings && cargo test` |
+| `sdk/rust` | `export RUSTUP_TOOLCHAIN=nightly-2026-03-01; cargo fmt --check && cargo clippy -- -D warnings && cargo test` |
+| `cli` | `export RUSTUP_TOOLCHAIN=nightly-2026-03-01; cargo fmt --check && cargo clippy -- -D warnings && cargo test` |
 | `sdk/typescript` | `npm ci && npm run build && npm test` |
 | `sdk/python` | `uv sync && uv run ruff check . && uv run ruff format --check . && uv run pytest` |
 | `sdk/go` | `go build ./... && go test ./...` |
