@@ -676,7 +676,6 @@ Every SDK exposes these operations in its own naming style. `base` is a host dir
 - `A`: P is in M and not in L. `M`: P is in L and in M, and P is delta-backed. `D`: P is in L and not in M.
 - The type is `f` (regular file), `d` (directory), `l` (symlink) or `?` (other). `A` and `M` use the merged entry. `D` uses the base entry.
 - Changes are sorted by path in byte order. The text form is one line per change, `<change> <type> <path>`, for example `M f /src/main.rs`.
-- A full walk of the base is not necessary: `A` and `M` come from the delta paths, and `D` comes from the base subtrees of the whiteouts.
 
 ### Unsupported in v1
 
@@ -771,6 +770,7 @@ Each case starts with a new overlay over this base. `write P "s"` creates P if i
 37. `createOverlay(dir/a.db, base)`; again → `EEXIST`; `listOverlays(dir)` and `listOverlays(dir, base)` → `dir/a.db`; `listOverlays(dir, other directory)` → empty; `deleteOverlay(dir/a.db)`; `listOverlays(dir)` → empty.
 38. Directories A and B have the same root `st_ino` on different filesystems (on Linux: `/dev/shm` and `/dev`). `createOverlay(dir/a.db, A)`; `openMerged(dir/a.db, B)` → `ESTALE`; `listOverlays(dir, B)` → empty.
 39. On a private copy of the base: `write /d/x "x2"`; `close`; set base `/f` to `edited` and base `/d/x` to `b2`; `openMerged` without base; `read /f` → `edited`; `read /d/x` → `x2`; `diff` → `M d /d; M f /d/x`.
+40. On a private copy of the base: `write /f "new"`; `close`; replace base `/f` with a directory that contains regular file `x`; `openMerged` without base; `diff` → `M f /f; D f /f/x`.
 
 ## Key-Value Data
 
