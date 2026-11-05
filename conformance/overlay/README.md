@@ -13,4 +13,5 @@
 - `legacyRust` copies `sdk/rust/tests/fixtures/legacy_rust_overlay.db` and sets its `base_path` to BASE.
 - A runner answers an op it cannot serve with `ENOSYS`, so the step fails.
 - `xfail`: the issues that must land before the case passes. List every issue whose bug the case exercises; `9` is the management API and `diff`.
-- A failing case without `xfail` is an error. A passing case with `xfail` is an error: remove the marker when its last issue lands.
+- `xfail_ts`: like `xfail`, for the TypeScript runner only. The TypeScript runner reads only `xfail_ts` and the Rust runner reads only `xfail`, so a case that one SDK passes does not break the other.
+- A failing case without `xfail` is an error. A passing case with `xfail` is an error: remove the marker when its last issue lands. The same holds for `xfail_ts`. A timeout, a signal, or a runner error fails the case even with a marker.
