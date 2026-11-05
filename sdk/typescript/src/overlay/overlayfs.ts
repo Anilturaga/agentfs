@@ -2,29 +2,14 @@ import type { DatabasePromise } from '@tursodatabase/database-common';
 import { createFsError, type FsErrorCode, type FsSyscall } from '../errors.js';
 import { AgentFS, AgentFSFile } from '../filesystem/agentfs.js';
 import {
-  S_IFMT,
-  S_IFREG,
-  S_IFDIR,
-  S_IFLNK,
-  createStats,
-  type DirEntry,
-  type FileHandle,
-  type FileSystem,
-  type FilesystemStats,
-  type Stats,
-  type StatsData,
+  S_IFMT, S_IFREG, S_IFDIR, S_IFLNK, createStats,
+  type DirEntry, type FileHandle, type FileSystem, type FilesystemStats, type Stats, type StatsData,
 } from '../filesystem/interface.js';
 
 /** Base entry stats. `mode` carries the file type bits; times are in seconds. */
 export interface LowerStats {
-  mode: number;
-  uid: number;
-  gid: number;
-  size: number;
-  nlink: number;
-  atime: number;
-  mtime: number;
-  ctime: number;
+  mode: number; uid: number; gid: number; size: number; nlink: number;
+  atime: number; mtime: number; ctime: number;
 }
 
 /**
@@ -46,33 +31,15 @@ export interface LowerAdapter {
   read(path: string, offset: number, length: number): Promise<Uint8Array>;
 }
 
-export interface OverlayInfo {
-  path: string;
-  version: number;
-  basePath: string;
-  baseIdentity: string;
-}
+export interface OverlayInfo { path: string; version: number; basePath: string; baseIdentity: string }
 
-export interface Change {
-  change: 'A' | 'M' | 'D';
-  type: 'f' | 'd' | 'l' | '?';
-  path: string;
-}
+export interface Change { change: 'A' | 'M' | 'D'; type: 'f' | 'd' | 'l' | '?'; path: string }
 
 /** A merged entry. `ino` is the instance-scoped inode number. */
-interface Entry {
-  ino: number;
-  deltaIno?: number;
-  lowerPath?: string;
-}
+interface Entry { ino: number; deltaIno?: number; lowerPath?: string }
 
 /** `lower` is the base entry at `path` when the base resolves it and no whiteout covers it. */
-interface Node {
-  entry: Entry;
-  path: string;
-  stats: Stats;
-  lower?: LowerStats;
-}
+interface Node { entry: Entry; path: string; stats: Stats; lower?: LowerStats }
 
 const MAX_LINKS = 40;
 const COLUMNS = 'i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime';
@@ -100,11 +67,7 @@ const closing = (db: DatabasePromise): DatabasePromise =>
         new Proxy({}, {
           get: (_, method: string) => async (...args: unknown[]) => {
             const stmt = target.prepare(sql) as any;
-            try {
-              return await stmt[method](...args);
-            } finally {
-              stmt.close();
-            }
+            try { return await stmt[method](...args); } finally { stmt.close(); }
           },
         });
     },
@@ -113,13 +76,10 @@ const closing = (db: DatabasePromise): DatabasePromise =>
 /** Storage key to its open overlay, or `null` while a management call holds the reservation. */
 const registry = new Map<unknown, OverlayFS | null>();
 
-/** @internal */
 export function claim(key: unknown): void {
   if (registry.has(key)) fail('EBUSY', 'open');
   registry.set(key, null);
 }
-
-/** @internal */
 export function release(key: unknown): void {
   registry.delete(key);
 }
@@ -142,9 +102,8 @@ export class OverlayFS implements FileSystem {
     private key: unknown
   ) {}
 
-  /** @internal */
   async load(): Promise<void> {
-    const rows = (await this.db.prepare('SELECT path FROM fs_whiteout').all()) as { path: string }[];
+    const rows: { path: string }[] = await this.db.prepare('SELECT path FROM fs_whiteout').all();
     this.whiteouts = new Set(rows.map((r) => r.path));
     this.rootLower = (await this.lower.lstat('/')) ?? undefined;
   }
@@ -166,9 +125,9 @@ export class OverlayFS implements FileSystem {
       const l = await this.lower.lstat(e.lowerPath!);
       return l ? createStats({ ino: e.ino, ...l }) : fail('ENOENT', 'stat', e.lowerPath);
     }
-    const row = (await this.db.prepare(`SELECT ${COLUMNS} FROM fs_inode i WHERE i.ino = ?`).get(e.deltaIno)) as
-      | StatsData
-      | undefined;
+    const row: StatsData | undefined = await this.db
+      .prepare(`SELECT ${COLUMNS} FROM fs_inode i WHERE i.ino = ?`)
+      .get(e.deltaIno);
     return row ? createStats({ ...row, ino: e.ino }) : fail('ENOENT', 'stat');
   }
 
@@ -192,18 +151,14 @@ export class OverlayFS implements FileSystem {
     return { entry, path, lower, stats: createStats({ ...lower, ino: entry.ino }) };
   }
 
-  /** The merged child of `dir`, by the spec's lookup precedence. */
   private async child(dir: Node, name: string): Promise<Node | null> {
     const path = join(dir.path, name);
     // `dir.lower` is set only when no whiteout covers `dir`, so a whiteout at `path` is the only one to check.
     const lower =
       isDir(dir.lower) && !this.whiteouts.has(path) ? ((await this.lower.lstat(path)) ?? undefined) : undefined;
     if (dir.entry.deltaIno !== undefined) {
-      const row = (await this.db
-        .prepare(
-          `SELECT ${COLUMNS} FROM fs_dentry d JOIN fs_inode i ON i.ino = d.ino WHERE d.parent_ino = ? AND d.name = ?`
-        )
-        .get(dir.entry.deltaIno, name)) as StatsData | undefined;
+      const sql = `SELECT ${COLUMNS} FROM fs_dentry d JOIN fs_inode i ON i.ino = d.ino WHERE d.parent_ino = ? AND d.name = ?`;
+      const row: StatsData | undefined = await this.db.prepare(sql).get(dir.entry.deltaIno, name);
       if (row) return this.deltaNode(path, row, lower);
     }
     return lower ? this.lowerNode(path, lower) : null;
@@ -211,9 +166,9 @@ export class OverlayFS implements FileSystem {
 
   private async target(node: Node): Promise<string> {
     if (node.entry.deltaIno === undefined) return this.lower.readlink(node.path);
-    const row = (await this.db.prepare('SELECT target FROM fs_symlink WHERE ino = ?').get(node.entry.deltaIno)) as
-      | { target: string }
-      | undefined;
+    const row: { target: string } | undefined = await this.db
+      .prepare('SELECT target FROM fs_symlink WHERE ino = ?')
+      .get(node.entry.deltaIno);
     return row?.target ?? fail('ENOENT', 'open', node.path);
   }
 
@@ -276,12 +231,10 @@ export class OverlayFS implements FileSystem {
     const names = new Set<string>();
     if (dir.entry.deltaIno !== undefined) {
       const rows = await this.db.prepare('SELECT name FROM fs_dentry WHERE parent_ino = ?').all(dir.entry.deltaIno);
-      for (const r of rows as { name: string }[]) names.add(r.name);
+      for (const r of rows) names.add(r.name);
     }
     if (isDir(dir.lower)) {
-      for (const n of await this.lower.readdir(dir.path)) {
-        if (!this.whiteouts.has(join(dir.path, n))) names.add(n);
-      }
+      for (const n of await this.lower.readdir(dir.path)) if (!this.whiteouts.has(join(dir.path, n))) names.add(n);
     }
     return [...names].sort((a, b) => this.cmp(a, b));
   }
@@ -297,10 +250,7 @@ export class OverlayFS implements FileSystem {
   async readFile(path: string): Promise<Buffer>;
   async readFile(path: string, encoding: BufferEncoding): Promise<string>;
   async readFile(path: string, options: { encoding: BufferEncoding }): Promise<string>;
-  async readFile(
-    path: string,
-    options?: BufferEncoding | { encoding?: BufferEncoding }
-  ): Promise<Buffer | string> {
+  async readFile(path: string, options?: BufferEncoding | { encoding?: BufferEncoding }): Promise<Buffer | string> {
     const encoding = typeof options === 'string' ? options : options?.encoding;
     const node = await this.file(path);
     const data = await this.pread(node.entry, 0, node.stats.size);
@@ -372,12 +322,10 @@ export class OverlayFS implements FileSystem {
       }
       return memo.get(path)!;
     };
-    const rows = this.db.prepare(
-      'SELECT d.name, i.ino, i.mode FROM fs_dentry d JOIN fs_inode i ON i.ino = d.ino WHERE d.parent_ino = ?'
-    );
+    const children = 'SELECT d.name, i.ino, i.mode FROM fs_dentry d JOIN fs_inode i ON i.ino = d.ino WHERE d.parent_ino = ?';
     const queue: [number, string][] = [[1, '/']];
     for (let item = queue.pop(); item; item = queue.pop()) {
-      for (const r of (await rows.all(item[0])) as { name: string; ino: number; mode: number }[]) {
+      for (const r of await this.db.prepare(children).all(item[0])) {
         const path = join(item[1], r.name);
         const inBase = await base(path);
         inDelta.add(path);
@@ -416,8 +364,7 @@ export async function initOverlay(raw: DatabasePromise, base: LowerAdapter, B: B
     await db.exec('ROLLBACK');
     throw e;
   }
-  const info = { version: 1, basePath: config.base_path, baseIdentity: config.base_identity };
-  return { delta, info };
+  return { delta, info: { version: 1, basePath: config.base_path, baseIdentity: config.base_identity } };
 }
 
 /**
@@ -435,10 +382,7 @@ export async function mount(
   const db = closing(raw);
   const has = (await db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'fs_overlay_config'").all()).length > 0;
   const config = new Map<string, string>();
-  if (has) {
-    const rows = (await db.prepare('SELECT key, value FROM fs_overlay_config').all()) as { key: string; value: string }[];
-    for (const r of rows) config.set(r.key, r.value);
-  }
+  if (has) for (const r of await db.prepare('SELECT key, value FROM fs_overlay_config').all()) config.set(r.key, r.value);
   const version = config.get('version');
   if (version !== undefined && version !== '1') fail('ENOTSUP', 'open');
   if (version === undefined) {
@@ -467,9 +411,8 @@ export async function createOverlay(db: DatabasePromise, base: LowerAdapter, B =
   const key = handleKey(db);
   claim(key);
   try {
-    if ((await closing(db).prepare("SELECT 1 FROM sqlite_master WHERE type = 'table'").all()).length > 0) {
-      fail('EEXIST', 'open', db.name);
-    }
+    const tables = await closing(db).prepare("SELECT 1 FROM sqlite_master WHERE type = 'table'").all();
+    if (tables.length > 0) fail('EEXIST', 'open', db.name);
     return { path: db.name, ...(await initOverlay(db, base, B)).info };
   } finally {
     release(key);

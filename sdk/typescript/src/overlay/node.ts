@@ -1,15 +1,7 @@
 import { Database } from '@tursodatabase/database';
 import { lstat, open, readdir, readlink, realpath, stat, unlink } from 'fs/promises';
 import { createFsError } from '../errors.js';
-import {
-  claim,
-  initOverlay,
-  mount,
-  release,
-  type LowerAdapter,
-  type OverlayFS,
-  type OverlayInfo,
-} from './overlayfs.js';
+import { claim, initOverlay, mount, release, type LowerAdapter, type OverlayFS, type OverlayInfo } from './overlayfs.js';
 
 const secs = (ms: number) => Math.floor(ms / 1000);
 
