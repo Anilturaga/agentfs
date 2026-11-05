@@ -514,7 +514,7 @@ CREATE TABLE fs_overlay_config (
 | `base_path` | Base locator. Host directory: its canonical absolute path. Other lower adapters: an adapter-defined string. |
 | `base_identity` | Base identity at initialization (see Lower Layer) |
 
-Initialization writes the three keys in one transaction. After that, only migration changes these rows.
+Initialization writes the three keys in one transaction. After that, only migration and `rebindOverlay` change these rows.
 
 #### Table: `fs_whiteout`
 
@@ -553,7 +553,7 @@ An SDK reads the base through a read-only lower adapter. The adapter provides:
 - `readlink(path)` - symlink target
 - `read(path, offset, length)` - bytes of a regular file
 
-The **host adapter** serves a host directory. Its locator is the canonical absolute path of the directory. Its identity is `host:<st_dev>:<st_ino>` of that directory in decimal, for example `host:2049:1234567`. A remount can change `st_dev` (for example after a container restart). The identity then changes and `openMerged` fails with `ESTALE`. Browser and Cloudflare targets inject their own adapter.
+The **host adapter** serves a host directory. Its locator is the canonical absolute path of the directory. Its identity is `host:<st_dev>:<st_ino>` of that directory in decimal, for example `host:2049:1234567`. A remount can change `st_dev` (for example after a container restart). The identity then changes and `openMerged` fails with `ESTALE` until the user calls `rebindOverlay`. Browser and Cloudflare targets inject their own adapter.
 
 The base MUST NOT change while an overlay over it is open. The base MAY change while no overlay over it is open. v1 does not detect such changes: after reopen, lower-backed entries show the current base, and delta entries and whiteouts keep their meaning by path.
 
@@ -665,6 +665,7 @@ Every SDK exposes these operations in its own naming style. `base` is a host dir
 - `MergedFS.diff() → Change[]` - See Diff.
 - `listOverlays(dir, base?) → OverlayInfo[]` - Read each regular file named `*.db` directly in `dir` that has `fs_overlay_config`. Skip files that cannot be read (for example encrypted databases). With `base`, keep only overlays whose `base_identity` is the identity of `base` (legacy: whose `base_path` is its canonical path). Sort by path.
 - `deleteOverlay(dbPath)` - If `dbPath` does not exist, fail with `ENOENT`. Take the lock. If the database has no `fs_overlay_config`, fail with `EINVAL`. Delete `dbPath` and its engine sidecar files (`-wal`, `-shm`, `-info`).
+- `rebindOverlay(dbPath, base)` - If `dbPath` does not exist, fail with `ENOENT`. Take the lock. If `version` is absent, fail with `EINVAL`; if it is not `1`, fail with `ENOTSUP`. In one transaction, overwrite `base_path` and `base_identity` with the locator and identity of `base`. Only this explicit call rebinds; `openMerged` never rebinds.
 - `OverlayInfo` - `{ path, version, basePath, baseIdentity }`. A legacy overlay has `version` 0 and an empty `baseIdentity`.
 - `Change` - `{ change: A | M | D, type: f | d | l | ?, path }`.
 
@@ -686,13 +687,13 @@ Every SDK exposes these operations in its own naming style. `base` is a host dir
 | Copy-up or `open` of a lower special file | `ENOTSUP` |
 | An overlay format version other than 1 | `ENOTSUP` |
 | An overlay on storage that allows concurrent clients without a lock | `ENOTSUP` |
-| A base whose identity is not `base_identity` | `ESTALE` |
+| A base whose identity is not `base_identity` (recover with `rebindOverlay`) | `ESTALE` |
 
 - SDKs report each error with its POSIX name (TypeScript and Python: `ErrnoException.code`).
 - Base hard links are independent merged entries. A copy-up of one path does not change the others.
 - Copy-up copies the full file. v1 has no partial copy-up.
 - Special files that are created in the delta follow the Virtual Filesystem section.
-- v1 does not specify: crash atomicity of multi-step operations, timestamp fidelity on copy-up, `ino` stability across reopen, reads through a handle after its entry is removed, directory redirects, hard-link identity across layers, concurrent readers, re-binding a v1 overlay to another base, and mount session lifecycle.
+- v1 does not specify: crash atomicity of multi-step operations, timestamp fidelity on copy-up, `ino` stability across reopen, reads through a handle after its entry is removed, directory redirects, hard-link identity across layers, concurrent readers, and mount session lifecycle.
 
 ### Decisions
 
@@ -707,6 +708,7 @@ Every SDK exposes these operations in its own naming style. `base` is a host dir
 | Instance-scoped `ino` | Browser and Cloudflare adapters have no stable inode numbers. | A persisted `ino` map |
 | One opener, enforced by a lock | Turso already takes the lock; caches need no invalidation. | Concurrent readers with generation checks |
 | Host identity is `st_dev` and `st_ino` of the base root | `st_ino` repeats across filesystems (mount roots are often inode 1). A false match merges an unrelated tree; a false mismatch is loud and loses no data. | `st_ino` only (false matches); filesystem UUID (no portable API in Node); content hash (slow) |
+| Only an explicit `rebindOverlay` changes the base binding | Identity changes on remount are expected; an explicit rebind keeps false matches impossible without stranding data. | Automatic rebind in `openMerged` (false matches); no recovery (stranded data) |
 | Legacy origins migrate with `lower_path` NULL | A legacy row stores a process-local counter, and the current dentry path is wrong after a rename. | Derive the path from the current dentry; keep `base_ino` |
 | The base may change while no overlay is open | The path merge gives a defined result for any base state, and users edit project bases between sessions. | Base immutable for the overlay's lifetime (unenforceable; breaks that workflow) |
 | Hard link across layers fails with `EXDEV` | A copy-up would split the base link group; tools fall back on `EXDEV`. | Copy up, then link |
@@ -771,6 +773,7 @@ Each case starts with a new overlay over this base. `write P "s"` creates P if i
 38. Directories A and B have the same root `st_ino` on different filesystems (on Linux: `/dev/shm` and `/dev`). `createOverlay(dir/a.db, A)`; `openMerged(dir/a.db, B)` → `ESTALE`; `listOverlays(dir, B)` → empty.
 39. On a private copy of the base: `write /d/x "x2"`; `close`; set base `/f` to `edited` and base `/d/x` to `b2`; `openMerged` without base; `read /f` → `edited`; `read /d/x` → `x2`; `diff` → `M d /d; M f /d/x`.
 40. On a private copy of the base: `write /f "new"`; `close`; replace base `/f` with a directory that contains regular file `x`; `openMerged` without base; `diff` → `M f /f; D f /f/x`.
+41. A and B are different directories. `createOverlay(dir/a.db, A)`; `openMerged(dir/a.db, A)`; `write /n "1"`; `close`; `openMerged(dir/a.db, B)` → `ESTALE`; `rebindOverlay(dir/a.db, B)`; `openMerged(dir/a.db)` succeeds; `read /n` → `1`.
 
 ## Key-Value Data
 
