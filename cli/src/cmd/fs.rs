@@ -212,6 +212,9 @@ pub async fn diff_filesystem(id_or_path: String) -> AnyhowResult<()> {
     };
 
     eprintln!("Base: {}", base_path);
+    if !std::path::Path::new(&base_path).exists() {
+        anyhow::bail!("base directory does not exist: {}", base_path);
+    }
 
     // Collect all changes
     let mut changes: Vec<(ChangeType, char, String)> = Vec::new();

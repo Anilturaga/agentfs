@@ -195,6 +195,40 @@ async fn legacy_rust_overlay_upgrades_keeping_whiteouts_and_origins() {
 }
 
 #[tokio::test]
+async fn legacy_overlay_with_missing_base_opens_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("legacy.db");
+    std::fs::copy(LEGACY_RUST_FIXTURE, &db).unwrap();
+    let missing = "/tmp/agentfs-legacy-fixture-base";
+    assert!(!Path::new(missing).exists());
+    let snapshot = async || {
+        let conn = raw(&db).await;
+        let mut all = Vec::new();
+        for table in ["fs_overlay_config", "fs_whiteout", "fs_origin"] {
+            all.push(rows(&conn, &format!("SELECT * FROM {table} ORDER BY 1")).await);
+        }
+        all
+    };
+    let before = snapshot().await;
+    assert_eq!(before[0].len(), 1);
+
+    let agent = AgentFS::open(opts(&db)).await.unwrap();
+    agent.kv.set("k", &"v").await.unwrap();
+    assert_eq!(agent.kv.get::<String>("k").await.unwrap().unwrap(), "v");
+    assert!(agent.fs.readdir(1).await.unwrap().is_some());
+    let conn = agent.get_connection().await.unwrap();
+    let result = OverlayFS::init_schema(&conn, missing).await;
+    assert!(
+        matches!(&result, Err(Error::BaseDirectoryNotFound(p)) if p == missing),
+        "{:?}",
+        result.err()
+    );
+    drop(conn);
+    drop(agent);
+    assert_eq!(snapshot().await, before);
+}
+
+#[tokio::test]
 async fn legacy_go_overlay_migrates_keeping_whiteouts() {
     let dir = tempfile::tempdir().unwrap();
     let base = make_base(dir.path());
