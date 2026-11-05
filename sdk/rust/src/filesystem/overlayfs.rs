@@ -67,6 +67,8 @@ pub struct OverlayFS {
     whiteouts: Arc<RwLock<HashSet<String>>>,
     /// Origins of copy-ups made in this session: delta_ino -> base_ino
     origin_map: Arc<RwLock<HashMap<i64, i64>>>,
+    /// Serializes copy-ups, so concurrent first writes to one entry copy it once
+    promote: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A handle to a lower-backed entry. Reads come from the base until the first write,
@@ -82,7 +84,7 @@ impl LowerHandle {
         let info = self.fs.get_inode_info(self.ino).ok_or(FsError::NotFound)?;
         let delta_ino = match info.layer {
             Layer::Delta => info.underlying_ino,
-            Layer::Base if write => self.fs.copy_up_and_update_mapping(self.ino, &info).await?,
+            Layer::Base if write => self.fs.copy_up_and_update_mapping(self.ino).await?,
             Layer::Base => return Ok(self.base_file.clone()),
         };
         FileSystem::open(&self.fs.delta, delta_ino, libc::O_RDWR).await
@@ -108,7 +110,11 @@ impl File for LowerHandle {
     }
 
     async fn fstat(&self) -> Result<Stats> {
-        self.file(false).await?.fstat().await
+        let stats = self.file(false).await?.fstat().await?;
+        Ok(Stats {
+            ino: self.ino,
+            ..stats
+        })
     }
 }
 
@@ -140,6 +146,7 @@ impl OverlayFS {
             next_ino: Arc::new(AtomicI64::new(2)),
             whiteouts: Arc::new(RwLock::new(HashSet::new())),
             origin_map: Arc::new(RwLock::new(HashMap::new())),
+            promote: Arc::default(),
         }
     }
 
@@ -613,7 +620,9 @@ impl OverlayFS {
         // If parent exists in delta, check if file already exists there
         if found_parent {
             if let Some(stats) = FileSystem::lookup(&self.delta, parent_ino, name).await? {
-                // Already copied up, return delta inode
+                if self.get_origin_ino(stats.ino) != Some(base_ino) {
+                    return Err(FsError::NotFound.into());
+                }
                 return Ok(stats.ino);
             }
         }
@@ -692,7 +701,15 @@ impl OverlayFS {
 
     /// Copy-up a file and update the inode mapping so subsequent operations
     /// go to the delta layer. Returns the delta inode.
-    async fn copy_up_and_update_mapping(&self, overlay_ino: i64, info: &InodeInfo) -> Result<i64> {
+    async fn copy_up_and_update_mapping(&self, overlay_ino: i64) -> Result<i64> {
+        let _promoting = self.promote.lock().await;
+        let info = self.get_inode_info(overlay_ino).ok_or(FsError::NotFound)?;
+        if info.layer == Layer::Delta {
+            return Ok(info.underlying_ino);
+        }
+        if self.is_whiteout(&info.path) {
+            return Err(FsError::NotFound.into());
+        }
         let delta_ino = self.copy_up(&info.path, info.underlying_ino).await?;
 
         // Update the inode mapping to point to delta
@@ -1002,7 +1019,7 @@ impl FileSystem for OverlayFS {
 
         let delta_ino = match info.layer {
             Layer::Delta => info.underlying_ino,
-            Layer::Base => self.copy_up_and_update_mapping(ino, &info).await?,
+            Layer::Base => self.copy_up_and_update_mapping(ino).await?,
         };
 
         self.delta.chmod(delta_ino, mode).await
@@ -1023,7 +1040,7 @@ impl FileSystem for OverlayFS {
 
         let delta_ino = match info.layer {
             Layer::Delta => info.underlying_ino,
-            Layer::Base => self.copy_up_and_update_mapping(ino, &info).await?,
+            Layer::Base => self.copy_up_and_update_mapping(ino).await?,
         };
 
         self.delta.chown(delta_ino, uid, gid).await
@@ -1039,7 +1056,7 @@ impl FileSystem for OverlayFS {
 
         let delta_ino = match info.layer {
             Layer::Delta => info.underlying_ino,
-            Layer::Base => self.copy_up_and_update_mapping(ino, &info).await?,
+            Layer::Base => self.copy_up_and_update_mapping(ino).await?,
         };
 
         self.delta.utimens(delta_ino, atime, mtime).await
@@ -1349,8 +1366,7 @@ impl FileSystem for OverlayFS {
 
         // If source is in base, copy to delta first
         if src_info.layer == Layer::Base {
-            self.copy_up_and_update_mapping(src_stats.ino, &src_info)
-                .await?;
+            self.copy_up_and_update_mapping(src_stats.ino).await?;
         }
 
         // Remove whiteout at destination
@@ -1473,6 +1489,7 @@ mod tests {
     #[tokio::test]
     async fn test_overlay_open_defers_copy_up_to_first_write() -> Result<()> {
         let (overlay, base_dir, _delta_dir) = create_test_overlay().await?;
+        overlay.lookup(ROOT_INO, "subdir").await?;
         let ino = overlay.lookup(ROOT_INO, "base.txt").await?.unwrap().ino;
 
         let reader = overlay.open(ino, libc::O_RDONLY).await?;
@@ -1485,11 +1502,13 @@ mod tests {
             .is_none());
         assert_eq!(overlay.get_inode_info(ino).unwrap().layer, Layer::Base);
 
+        assert_eq!(reader.fstat().await?.ino, ino);
+
         let writer = overlay.open(ino, libc::O_RDWR).await?;
         writer.pwrite(0, b"changed").await?;
-        assert!(FileSystem::lookup(overlay.delta(), 1, "base.txt")
-            .await?
-            .is_some());
+        let delta_stats = FileSystem::lookup(overlay.delta(), 1, "base.txt").await?;
+        assert_ne!(delta_stats.unwrap().ino, ino);
+        assert_eq!(reader.fstat().await?.ino, ino);
         assert_eq!(reader.pread(0, 100).await?, b"changedntent");
         assert_eq!(
             std::fs::read(base_dir.path().join("base.txt"))?,
@@ -1514,6 +1533,59 @@ mod tests {
         let moved = overlay.lookup(ROOT_INO, "moved.txt").await?.unwrap();
         let read = overlay.open(moved.ino, libc::O_RDONLY).await?;
         assert_eq!(read.pread(0, 100).await?, b"changedntent");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_stale_handle_cannot_write_replacement() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+        let ino = overlay.lookup(ROOT_INO, "base.txt").await?.unwrap().ino;
+        let stale = overlay.open(ino, libc::O_RDWR).await?;
+        overlay.unlink(ROOT_INO, "base.txt").await?;
+        assert!(stale.pwrite(0, b"OLD").await.is_err());
+
+        let (_, file) = overlay
+            .create_file(ROOT_INO, "base.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        file.pwrite(0, b"replacement").await?;
+        assert!(stale.pwrite(0, b"OLD").await.is_err());
+        assert_eq!(file.pread(0, 100).await?, b"replacement");
+
+        let (_, other) = overlay
+            .create_file(ROOT_INO, "other.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        other.pwrite(0, b"renamed").await?;
+        let ino = overlay.lookup(ROOT_INO, "subdir").await?.unwrap().ino;
+        let nested = overlay.lookup(ino, "nested.txt").await?.unwrap().ino;
+        let stale = overlay.open(nested, libc::O_RDWR).await?;
+        overlay
+            .rename(ROOT_INO, "other.txt", ino, "nested.txt")
+            .await?;
+        assert!(stale.truncate(0).await.is_err());
+        let moved = overlay.lookup(ino, "nested.txt").await?.unwrap();
+        let read = overlay.open(moved.ino, libc::O_RDONLY).await?;
+        assert_eq!(read.pread(0, 100).await?, b"renamed");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_concurrent_first_writes_copy_up_once() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+        let ino = overlay.lookup(ROOT_INO, "base.txt").await?.unwrap().ino;
+        let mut writes = Vec::new();
+        for i in 0..8u8 {
+            let file = overlay.open(ino, libc::O_RDWR).await?;
+            writes.push(tokio::spawn(async move {
+                file.pwrite(i as u64, &[b'0' + i]).await
+            }));
+        }
+        for write in writes {
+            write.await.unwrap()?;
+        }
+        let file = overlay.open(ino, libc::O_RDONLY).await?;
+        assert_eq!(file.pread(0, 100).await?, b"01234567tent");
 
         Ok(())
     }
