@@ -460,22 +460,21 @@ class Filesystem:
 
         await assert_readable_existing_inode(self._db, ino, "open", normalized_path)
 
-        # Get all data chunks
-        cursor = await self._db.execute(
-            """
-            SELECT data FROM fs_data
-            WHERE ino = ?
-            ORDER BY chunk_index ASC
-            """,
-            (ino,),
-        )
-        rows = await cursor.fetchall()
+        cursor = await self._db.execute("SELECT size FROM fs_inode WHERE ino = ?", (ino,))
+        size = (await cursor.fetchone())[0]
 
-        if not rows:
-            combined = b""
-        else:
-            # Concatenate all chunks
-            combined = b"".join(row[0] for row in rows)
+        # Chunk i holds bytes [i * chunk_size, (i + 1) * chunk_size); missing chunks and
+        # short chunks are holes that read as zeros.
+        cursor = await self._db.execute(
+            "SELECT chunk_index, data FROM fs_data WHERE ino = ?", (ino,)
+        )
+        buffer = bytearray(size)
+        for chunk_index, data in await cursor.fetchall():
+            start = chunk_index * self._chunk_size
+            if start < size:
+                data = data[: min(self._chunk_size, size - start)]
+                buffer[start : start + len(data)] = data
+        combined = bytes(buffer)
 
         # Update atime
         now = int(time.time())

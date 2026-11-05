@@ -508,6 +508,40 @@ class TestFilesystemChunkSize:
             assert len(read_data) == data_size
             await db.close()
 
+    async def test_read_sparse_file_as_written_by_rust(self):
+        """Should read holes as zeros and honor the stored size"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            db = await connect(db_path)
+            await db.execute("PRAGMA unstable_capture_data_changes_conn('full')")
+            fs = await Filesystem.from_database(db)
+            chunk_size = fs.get_chunk_size()
+
+            async def store(path, chunks, size):
+                await fs.write_file(path, "")
+                ino = await fs._resolve_path(path)
+                for index, data in chunks.items():
+                    await db.execute(
+                        "INSERT INTO fs_data (ino, chunk_index, data) VALUES (?, ?, ?)",
+                        (ino, index, data),
+                    )
+                await db.execute("UPDATE fs_inode SET size = ? WHERE ino = ?", (size, ino))
+                await db.commit()
+
+            # Extended by truncate: one short chunk, size beyond it.
+            await store("/tail.bin", {0: b"x"}, 10)
+            assert await fs.read_file("/tail.bin", encoding=None) == b"x" + bytes(9)
+
+            # Written at two offsets: chunk 1 is missing, chunk 0 is short.
+            await store("/middle.bin", {0: b"ab", 2: b"z"}, 2 * chunk_size + 1)
+            expected = b"ab" + bytes(2 * chunk_size - 2) + b"z"
+            assert await fs.read_file("/middle.bin", encoding=None) == expected
+
+            # Chunks past a shrunken size are not returned.
+            await store("/shrunk.bin", {0: b"abc", 1: b"def"}, 2)
+            assert await fs.read_file("/shrunk.bin", encoding=None) == b"ab"
+            await db.close()
+
 
 @pytest.mark.asyncio
 class TestFilesystemDataIntegrity:
