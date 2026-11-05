@@ -122,8 +122,9 @@ type Hook = Box<dyn Fn()>;
 
 #[cfg(test)]
 thread_local! {
-    /// Runs between opening the file and locking it (0), and before delete unlinks it (1).
-    static HOOKS: std::cell::RefCell<[Option<Hook>; 2]> = Default::default();
+    /// Runs between opening the file and locking it (0), before delete unlinks it (1), and between
+    /// creating a file and reserving it (2).
+    static HOOKS: std::cell::RefCell<[Option<Hook>; 3]> = Default::default();
 }
 
 #[cfg(test)]
@@ -139,24 +140,36 @@ pub(crate) struct Reservation {
 
 impl Reservation {
     /// Like `acquire`, after creating the file if it is absent. `create_new` fails without
-    /// opening a descriptor when the file exists, so a held database keeps its lock.
+    /// opening a descriptor when the file exists, so a held database keeps its lock. The
+    /// descriptor of a new file becomes the reservation's, or is parked if another one wins.
     pub(crate) fn acquire_or_create(path: &str) -> Result<Self> {
-        let created = OpenOptions::new().write(true).create_new(true).open(path);
-        if matches!(created, Err(ref e) if e.kind() != ErrorKind::AlreadyExists) {
-            return Err(created.unwrap_err().into());
+        let created = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path);
+        #[cfg(test)]
+        hook(2);
+        match created {
+            Ok(file) => Self::reserve(Path::new(path), Some(file)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Self::acquire(Path::new(path)),
+            Err(e) => Err(e.into()),
         }
-        drop(created);
-        Self::acquire(Path::new(path))
     }
 
     /// Reserves the existing file at `path`: `ENOENT` if it is absent or the path changes
     /// meanwhile, `EBUSY` if this process or another one holds it.
     pub(crate) fn acquire(path: &Path) -> Result<Self> {
+        Self::reserve(path, None)
+    }
+
+    fn reserve(path: &Path, created: Option<File>) -> Result<Self> {
         let db = path.display().to_string();
         let key = key_of(path).map_err(|_| not_found(&db))?;
         {
             let mut registry = registry();
-            if registry.contains_key(&key) {
+            if let Some(entry) = registry.get_mut(&key) {
+                entry.parked.extend(created);
                 return Err(busy(&db));
             }
             registry.insert(key, Entry::default());
@@ -166,7 +179,10 @@ impl Reservation {
             file: None,
             db,
         };
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let file = match created {
+            Some(file) => file,
+            None => OpenOptions::new().read(true).write(true).open(path)?,
+        };
         let opened = file.metadata().map(|m| (m.dev(), m.ino()))?;
         if opened != key {
             // The path now names another file. Closing a descriptor of a held file would
@@ -423,7 +439,11 @@ pub async fn rebind_overlay(db: AgentFSOptions, base: &Base) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::Cell, process::Command, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        process::Command,
+        rc::Rc,
+    };
 
     fn opts(path: &Path) -> AgentFSOptions {
         AgentFSOptions::with_path(path.to_str().unwrap())
@@ -490,6 +510,26 @@ mod tests {
         };
         let file = OpenOptions::new().read(true).write(true).open(db).unwrap();
         std::process::exit(if try_lock(&file).is_err() { 0 } else { 3 });
+    }
+
+    #[test]
+    fn creating_opener_cannot_drop_the_lock_of_a_racing_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("new.db");
+        let winner = Rc::new(RefCell::new(None));
+        let (path, slot) = (db.clone(), winner.clone());
+        set_hook(2, move || {
+            *slot.borrow_mut() = Some(Reservation::acquire(&path).unwrap());
+        });
+        let created = Reservation::acquire_or_create(db.to_str().unwrap());
+        HOOKS.with(|hooks| hooks.borrow_mut()[2] = None);
+        assert_eq!(errno(created), Some(libc::EBUSY));
+        let probe = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "overlay::tests::probe"])
+            .env("PROBE_DB", &db)
+            .status();
+        assert_eq!(probe.unwrap().code(), Some(0));
+        assert!(winner.borrow().is_some());
     }
 
     #[tokio::test]

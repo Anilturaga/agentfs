@@ -345,10 +345,9 @@ impl AgentFS {
         let db_path = options.db_path()?;
         let meta_path = format!("{db_path}-info");
 
-        // Every engine open of a file on disk goes behind a reservation. A new synced
-        // database has no file yet, and the engine creates it.
+        // Every engine open of a file on disk goes behind a reservation
+        let existed = Path::new(&db_path).exists();
         let held = match held {
-            None if options.sync.remote_url.is_some() && !Path::new(&db_path).exists() => None,
             None => connection_pool::ConnectionPool::reserve(&db_path)?,
             held => held,
         };
@@ -367,7 +366,12 @@ impl AgentFS {
             if let Some(partial_sync) = options.sync.partial_sync {
                 builder = builder.with_partial_sync_opts_experimental(partial_sync);
             }
-            let db = builder.build().await?;
+            let db = builder.build().await.inspect_err(|_| {
+                // The reservation created the file; a failed new database leaves none behind
+                if !existed {
+                    let _ = std::fs::remove_file(&db_path);
+                }
+            })?;
             let pool = connection_pool::ConnectionPool::new_sync(db.clone());
             held.into_iter().for_each(|held| pool.hold(held));
             (Some(db), pool)

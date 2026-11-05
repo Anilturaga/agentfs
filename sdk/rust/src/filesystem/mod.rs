@@ -418,7 +418,7 @@ impl PathFS {
     /// that the last name reaches when it is a dangling symlink.
     async fn creation_site(&self, path: &str) -> Result<(i64, String)> {
         let mut path = path.to_string();
-        for _ in 0..40 {
+        for _ in 0..=40 {
             let (dir, name) = self.split(&path).await?;
             let link = match self.0.lookup(dir, name).await? {
                 Some(link) if link.is_symlink() => link,

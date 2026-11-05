@@ -136,6 +136,17 @@ fn helper() {
             println!("removed");
             wait_for_input();
         }
+        "read_added" => {
+            let merged = rt
+                .block_on(open_merged(opts(Path::new(&db)), None))
+                .unwrap();
+            let paths = PathFS(Arc::new(merged.fs.clone()));
+            let data = rt.block_on(paths.read_file("/added")).unwrap();
+            println!(
+                "{}",
+                data.map_or("missing".to_string(), |d| String::from_utf8(d).unwrap())
+            );
+        }
         "open_loop" => loop {
             let opened = rt.block_on(open_merged(
                 opts(Path::new(&db)),
@@ -360,6 +371,22 @@ async fn path_fs_resolves_dot_dot_and_symlinks() {
         .await
         .unwrap()
         .is_symlink());
+    for links in [39, 40, 41] {
+        for i in 0..links {
+            let target = if i + 1 < links {
+                format!("chain{}_{}", links, i + 1)
+            } else {
+                format!("end{links}")
+            };
+            let name = format!("chain{links}_{i}");
+            FileSystem::symlink(&*fs, 1, &name, &target, 0, 0)
+                .await
+                .unwrap();
+        }
+        let written = paths.write_file(&format!("/chain{links}_0"), b"x").await;
+        let expected = (links > 40).then_some(libc::ELOOP);
+        assert_eq!(written.err().and_then(|e| e.errno()), expected);
+    }
     let into_file = paths.rename("/a/b/f", "/a/b/f/g").await;
     assert_eq!(into_file.unwrap_err().errno(), Some(libc::ENOTDIR));
     assert!(paths.stat("/a/b/f").await.unwrap().is_some());
@@ -383,6 +410,36 @@ async fn delete_accepts_an_overlay_with_an_empty_config_table() {
         .unwrap();
     drop((conn, raw));
     delete_overlay(opts(&db)).await.unwrap();
+    assert!(!db.exists());
+}
+
+#[tokio::test]
+async fn hard_link_alias_sees_the_data_after_the_handles_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = overlay(dir.path(), "o.db").await;
+    let alias = dir.path().join("alias.db");
+    std::fs::hard_link(&db, &alias).unwrap();
+    let merged = open_merged(opts(&db), None).await.unwrap();
+    PathFS(Arc::new(merged.fs.clone()))
+        .write_file("/added", b"x")
+        .await
+        .unwrap();
+    drop(merged);
+
+    let mut child = spawn("read_added", &alias, &alias);
+    wait_for(&mut child, "x");
+    finish(child);
+}
+
+#[tokio::test]
+async fn failed_new_synced_database_leaves_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("new.db");
+    let remote = SyncOptions {
+        remote_url: Some("http://127.0.0.1:9".to_string()),
+        ..Default::default()
+    };
+    assert!(AgentFS::open(opts(&db).with_sync(remote)).await.is_err());
     assert!(!db.exists());
 }
 

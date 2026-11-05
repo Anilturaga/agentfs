@@ -162,6 +162,30 @@ impl ConnectionPool {
     }
 }
 
+impl Drop for ConnectionPoolInner {
+    /// A hard link of a database file has sidecars of its own, so a reserved database has its
+    /// log checkpointed into the file before the reservation ends.
+    fn drop(&mut self) {
+        if let (DatabaseType::Local(db), Some(_)) = (&self.db, self.keep.get()) {
+            let db = db.clone();
+            let checkpoint = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let mut rows = db
+                        .connect()?
+                        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+                        .await?;
+                    while rows.next().await?.is_some() {}
+                    Ok::<_, turso::Error>(())
+                })
+            });
+            let _ = checkpoint.join();
+        }
+    }
+}
+
 /// A connection borrowed from the pool.
 ///
 /// When dropped, the connection is returned to the pool for reuse and the
