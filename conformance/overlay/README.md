@@ -14,4 +14,5 @@
 - A runner answers an op it cannot serve with `ENOSYS`, so the step fails.
 - `xfail`: the issues that must land before the case passes. List every issue whose bug the case exercises; `9` is the management API and `diff`.
 - `xfail_ts`, `xfail_py`: like `xfail`, for the TypeScript and Python runners only. Each runner reads only its own key (the Rust runner reads only `xfail`), so a case that one SDK passes does not break another.
+- `na_ts`: the reason why a case does not apply to the TypeScript runner, which skips it. TypeScript rejects legacy databases instead of migrating them (cases 35 and 36).
 - A failing case without `xfail` is an error. A passing case with `xfail` is an error: remove the marker when its last issue lands. The same holds for `xfail_ts` and `xfail_py`. A timeout, a signal, or a runner error fails the case even with a marker.

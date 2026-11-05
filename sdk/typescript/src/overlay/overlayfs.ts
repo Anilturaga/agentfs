@@ -45,9 +45,10 @@ const MAX_LINKS = 40;
 const COLUMNS = 'i.ino, i.mode, i.nlink, i.uid, i.gid, i.size, i.atime, i.mtime, i.ctime';
 const TYPES: Record<number, Change['type']> = { [S_IFREG]: 'f', [S_IFDIR]: 'd', [S_IFLNK]: 'l' };
 
-const fail = (code: FsErrorCode, syscall: FsSyscall, path?: string): never => {
-  throw createFsError({ code, syscall, path });
+export const fail = (code: FsErrorCode, syscall: FsSyscall, path?: string, message?: string): never => {
+  throw createFsError({ code, syscall, path, message });
 };
+const LEGACY = 'legacy overlay database: open it once with the agentfs CLI or Rust SDK to upgrade to format v1';
 const join = (dir: string, name: string) => `${dir === '/' ? '' : dir}/${name}`;
 const split = (path: string) => path.split('/').filter((c, i, all) => c || (i > 0 && i === all.length - 1)).reverse();
 const isDir = (s?: { mode: number } | null) => !!s && (s.mode & S_IFMT) === S_IFDIR;
@@ -86,6 +87,14 @@ export function claim(key: unknown): void {
 export function release(key: unknown): void {
   registry.delete(key);
 }
+export const holder = (key: unknown) => registry.get(key);
+
+/** @internal The `fs_overlay_config` rows of `raw`, or undefined if it has no such table. */
+export async function readConfig(raw: DatabasePromise): Promise<Map<string, string> | undefined> {
+  const db = closing(raw);
+  if (!(await db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'fs_overlay_config'").all()).length) return undefined;
+  return new Map((await db.prepare('SELECT key, value FROM fs_overlay_config').all()).map((r) => [r.key, r.value]));
+}
 
 /** A writable AgentFS delta over a read-only base. */
 export class OverlayFS implements FileSystem {
@@ -111,6 +120,9 @@ export class OverlayFS implements FileSystem {
     this.whiteouts = new Set(rows.map((r) => r.path));
     this.rootLower = (await this.lower.lstat('/')) ?? undefined;
   }
+
+  /** @internal The stored configuration, read for `listOverlays`. */
+  config = () => readConfig(this.db);
 
   /** Finishes the accepted mutations, then releases the writer lock. A second call does nothing. */
   async close(): Promise<void> {
@@ -557,7 +569,7 @@ export async function initOverlay(raw: DatabasePromise, base: LowerAdapter, B: B
 /**
  * @internal Classifies the database before any write, initializes it if needed, and opens it.
  * The caller has claimed `key` and owns `db`. Without `base`, `host` opens the recorded `base_path`.
- * Migration is not implemented: it fails with `ENOSYS`.
+ * A legacy database is not migrated: it fails with `ENOTSUP`.
  */
 export async function mount(
   raw: DatabasePromise,
@@ -567,20 +579,18 @@ export async function mount(
   host?: (dir: string) => Promise<LowerAdapter>
 ): Promise<OverlayFS> {
   const db = closing(raw);
-  const has = (await db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'fs_overlay_config'").all()).length > 0;
-  const config = new Map<string, string>();
-  if (has) for (const r of await db.prepare('SELECT key, value FROM fs_overlay_config').all()) config.set(r.key, r.value);
-  const version = config.get('version');
+  const config = await readConfig(raw);
+  const version = config?.get('version');
   if (version !== undefined && version !== '1') fail('ENOTSUP', 'open');
   if (version === undefined) {
-    if (has) fail('ENOSYS', 'open');
+    if (config) fail('ENOTSUP', 'open', undefined, LEGACY);
     if (!base) fail('EINVAL', 'open');
     const legacy = "SELECT 1 FROM pragma_table_info('fs_whiteout') WHERE name = 'parent_path'";
-    if ((await db.prepare(legacy).all()).length > 0) fail('ENOSYS', 'open');
+    if ((await db.prepare(legacy).all()).length > 0) fail('ENOTSUP', 'open', undefined, LEGACY);
   }
-  const basePath = config.get('base_path');
+  const basePath = config?.get('base_path');
   const lower = base ?? (host && basePath ? await host(basePath) : fail('EINVAL', 'open'));
-  if (version === '1' && (await lower.identity()) !== config.get('base_identity')) fail('ESTALE', 'open');
+  if (version === '1' && (await lower.identity()) !== config?.get('base_identity')) fail('ESTALE', 'open');
   const delta = version === '1' ? await AgentFS.fromDatabase(db, B) : (await initOverlay(raw, lower, B)).delta;
   const overlay = new OverlayFS(db, delta, lower, B, key);
   await overlay.load();
@@ -588,7 +598,24 @@ export async function mount(
   return overlay;
 }
 
-const handleKey = (db: DatabasePromise) => (db.memory ? db : `name:${db.name}`);
+/** Fails with `ENOTSUP` for a lockless handle, before any query. */
+const handleKey = (db: DatabasePromise & { lockless?: boolean }) =>
+  db.lockless ? fail('ENOTSUP', 'open', db.name, 'overlay needs a database with a writer lock') : db.memory ? db : `name:${db.name}`;
+
+/** @internal Points the v1 overlay in `db` at `base`; one statement, so one transaction. */
+export async function rebind(db: DatabasePromise, base: LowerAdapter): Promise<void> {
+  const version = (await readConfig(db))?.get('version');
+  if (version !== '1') fail(version === undefined ? 'EINVAL' : 'ENOTSUP', 'open');
+  const set = "UPDATE fs_overlay_config SET value = CASE key WHEN 'base_path' THEN ? ELSE ? END WHERE key IN ('base_path', 'base_identity')";
+  await closing(db).prepare(set).run(base.locator, await base.identity());
+}
+
+/** Points the overlay in a database that the caller opened at `base`. The call never closes `db`. */
+export async function rebindOverlay(db: DatabasePromise, base: LowerAdapter): Promise<void> {
+  const key = handleKey(db);
+  claim(key);
+  await rebind(db, base).finally(() => release(key));
+}
 
 /**
  * Initializes a v1 overlay in a database that the caller opened. Fails with `EEXIST` if the

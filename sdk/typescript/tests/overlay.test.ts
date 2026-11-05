@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { createOverlay, hostLower, openMerged } from '../src/overlay/node.js';
+import { createOverlay, deleteOverlay, hostLower, openMerged } from '../src/overlay/node.js';
 import {
   createOverlay as createOnHandle,
   openMerged as openOnHandle,
@@ -445,8 +445,10 @@ describe('OverlayFS read path', () => {
       symlinkSync(db, join(root, 'soft.db'));
       for (const p of [db, join(root, 'hard.db'), join(root, 'soft.db')]) {
         expect(await code(openMerged(p))).toBe('EBUSY');
+        expect(await code(deleteOverlay(p))).toBe('EBUSY');
         expect(await overlay.readFile('/f', 'utf8')).toBe('base');
       }
+      rmSync(join(root, 'hard.db'));
       expect(await childOpen(db)).toBe('EBUSY');
 
       await overlay.close();

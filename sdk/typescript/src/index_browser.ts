@@ -26,5 +26,6 @@ export type { ToolCall, ToolCallStats } from './toolcalls.js';
 
 export { OverlayFS } from './overlay/overlayfs.js';
 export type { Change, LowerAdapter, LowerStats, OverlayInfo } from './overlay/overlayfs.js';
+export { rebindOverlay } from './overlay/overlayfs.js';
 export const createOverlay = (db: DatabasePromise, base: LowerAdapter) => create(db, base, Buffer);
 export const openMerged = (db: DatabasePromise, base: LowerAdapter) => open(db, base, Buffer);

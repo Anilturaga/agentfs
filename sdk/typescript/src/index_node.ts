@@ -77,4 +77,4 @@ export { ToolCalls } from './toolcalls.js';
 export type { ToolCall, ToolCallStats } from './toolcalls.js';
 export { OverlayFS } from './overlay/overlayfs.js';
 export type { Change, LowerAdapter, LowerStats, OverlayInfo } from './overlay/overlayfs.js';
-export { createOverlay, hostLower, openMerged } from './overlay/node.js';
+export { createOverlay, deleteOverlay, hostLower, listOverlays, openMerged, rebindOverlay } from './overlay/node.js';

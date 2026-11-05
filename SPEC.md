@@ -654,6 +654,8 @@ Migration runs in one transaction. A failed migration leaves the database unchan
 2. `fs_origin`: create it if absent. If it has a `base_ino` column, rebuild it as v1: keep every row and set `lower_path` to NULL.
 3. `fs_overlay_config`: create it if absent. Write `base_path` and `base_identity` from the base that is being opened. Write `version` = `1` last.
 
+SDKs other than the reference MAY reject legacy databases with `ENOTSUP`.
+
 The AgentFS schema version (`0.4`) is independent of the overlay format version.
 
 ### Management Operations
@@ -870,6 +872,7 @@ Such extensions SHOULD use separate tables to maintain referential integrity.
 - A write or truncate through a handle whose lower-backed entry was removed or replaced before copy-up fails with `ENOENT`
 - Conformance case 6 is the spec trace again; its `ino` assertion is now case 42
 - `listOverlays` reads without the lock only where the storage engine allows it. Where it does not (the Rust SDK on turso 0.4.4), it takes the lock for each read and MAY omit a database that another instance holds open
+- Versioning and Migration: SDKs other than the reference MAY reject legacy databases with `ENOTSUP`
 - The overlay format version stays 1 and the schema does not change
 
 ### Overlay Format v1
