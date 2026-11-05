@@ -126,7 +126,8 @@ async fn new_overlay_has_v1_schema_and_copy_up_records_lower_path() {
     overlay.load().await.unwrap();
     let d = overlay.lookup(1, "d").await.unwrap().unwrap();
     let x = overlay.lookup(d.ino, "x").await.unwrap().unwrap();
-    overlay.open(x.ino, libc::O_RDWR).await.unwrap();
+    let file = overlay.open(x.ino, libc::O_RDWR).await.unwrap();
+    file.pwrite(0, b"y").await.unwrap();
     let conn = overlay.delta().get_connection().await.unwrap();
     let origins = rows(
         &conn,
