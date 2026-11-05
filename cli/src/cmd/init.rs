@@ -109,12 +109,22 @@ pub async fn init_database(
     let db_path = agentfs_dir().join(format!("{}.db", id));
     if db_path.exists() {
         if force {
-            for entry in std::fs::read_dir(agentfs_dir())? {
-                let entry = entry?;
-                let file_name = entry.file_name();
-                if file_name.to_string_lossy().starts_with(&id) {
-                    std::fs::remove_file(entry.path())
-                        .context("Failed to remove existing database file(s)")?;
+            for suffix in [
+                "",
+                "-wal",
+                "-shm",
+                "-log",
+                "-wal-revert",
+                "-info",
+                "-changes",
+            ] {
+                let mut path = db_path.clone().into_os_string();
+                path.push(suffix);
+                match std::fs::remove_file(&path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(e).context("Failed to remove existing database file(s)");
+                    }
+                    _ => {}
                 }
             }
         } else {
@@ -269,4 +279,62 @@ async fn run_init_cmd(
     _agent: AgentFS,
 ) -> AnyhowResult<()> {
     anyhow::bail!("The -c option is not supported on Windows")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn force_init_removes_only_target_agent_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        std::fs::create_dir(".agentfs").unwrap();
+
+        let target = [
+            "force.db",
+            "force.db-wal",
+            "force.db-shm",
+            "force.db-log",
+            "force.db-wal-revert",
+            "force.db-info",
+            "force.db-changes",
+        ];
+        let others = ["force-victim.db", "force-victim.db-wal", "force.dbx"];
+        for name in target.iter().chain(&others) {
+            std::fs::write(agentfs_dir().join(name), "stale").unwrap();
+        }
+
+        init_database(
+            Some("force".to_string()),
+            SyncCommandOptions {
+                sync_remote_url: None,
+                sync_partial_prefetch: None,
+                sync_partial_segment_size: None,
+                sync_partial_bootstrap_query: None,
+                sync_partial_bootstrap_length: None,
+            },
+            true,
+            None,
+            None,
+            None,
+            MountBackend::default(),
+        )
+        .await
+        .unwrap();
+
+        for name in others {
+            assert!(agentfs_dir().join(name).exists(), "{name} was deleted");
+        }
+        for name in &target[1..] {
+            assert!(
+                std::fs::read(agentfs_dir().join(name)).map_or(true, |c| c != b"stale"),
+                "{name} was not removed"
+            );
+        }
+        assert_ne!(
+            std::fs::read(agentfs_dir().join("force.db")).unwrap(),
+            b"stale"
+        );
+    }
 }
