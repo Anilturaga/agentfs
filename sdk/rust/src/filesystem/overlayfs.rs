@@ -552,6 +552,28 @@ impl OverlayFS {
         .map(|s| s.ino))
     }
 
+    /// Point the cached paths of the delta entries at or below `old` to `new`, after
+    /// a rename. Lower entries do not move: their cached paths stay.
+    fn rebase_paths(&self, old: &str, new: &str) {
+        let mut inode_map = self.inode_map.write().unwrap();
+        let mut path_map = self.path_map.write().unwrap();
+        for (&ino, info) in inode_map
+            .iter_mut()
+            .filter(|(_, i)| i.layer == Layer::Delta)
+        {
+            let rest = match info.path.strip_prefix(old) {
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
+                _ => continue,
+            };
+            let moved = format!("{new}{rest}");
+            if path_map.get(&info.path) == Some(&ino) {
+                path_map.remove(&info.path);
+            }
+            path_map.insert(moved.clone(), ino);
+            info.path = moved;
+        }
+    }
+
     /// Ensure parent directories exist in delta layer
     async fn ensure_parent_dirs(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
         let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -1288,7 +1310,9 @@ impl FileSystem for OverlayFS {
         // Collect the lower-backed entries of the merged subtree, parents first. An
         // entry is lower-backed if its directory has no delta dentry for it. A
         // directory in the subtree that is the new parent makes D a descendant of S.
-        let mut lower = Vec::new();
+        // A directory that cannot be listed ends its branch of the scan; its error is
+        // reported after the checks that come first in the spec.
+        let (mut lower, mut scan_error) = (Vec::new(), None);
         let mut pending = vec![(old_path.clone(), src_stats.clone(), src_delta)];
         while let Some((path, stats, delta_ino)) = pending.pop() {
             if stats.is_directory() && stats.ino == newparent_ino {
@@ -1298,13 +1322,22 @@ impl FileSystem for OverlayFS {
                 lower.push((path.clone(), stats.clone()));
             }
             if stats.is_directory() {
-                for entry in self.readdir_plus(stats.ino).await?.unwrap_or_default() {
-                    let child = match delta_ino {
-                        Some(dir) => FileSystem::lookup(&self.delta, dir, &entry.name).await?,
-                        None => None,
-                    };
-                    let child_path = format!("{path}/{}", entry.name);
-                    pending.push((child_path, entry.stats, child.map(|s| s.ino)));
+                let children: Result<_> = async {
+                    let mut children = Vec::new();
+                    for entry in self.readdir_plus(stats.ino).await?.unwrap_or_default() {
+                        let child = match delta_ino {
+                            Some(dir) => FileSystem::lookup(&self.delta, dir, &entry.name).await?,
+                            None => None,
+                        };
+                        let child_path = format!("{path}/{}", entry.name);
+                        children.push((child_path, entry.stats, child.map(|s| s.ino)));
+                    }
+                    Ok(children)
+                }
+                .await;
+                match children {
+                    Ok(children) => pending.extend(children),
+                    Err(e) => scan_error = scan_error.or(Some(e)),
                 }
             }
         }
@@ -1319,6 +1352,9 @@ impl FileSystem for OverlayFS {
             if dst.is_directory() && !self.readdir(dst.ino).await?.unwrap_or_default().is_empty() {
                 return Err(FsError::NotEmpty.into());
             }
+        }
+        if let Some(e) = scan_error {
+            return Err(e);
         }
         if lower
             .iter()
@@ -1366,6 +1402,7 @@ impl FileSystem for OverlayFS {
         )
         .await?;
 
+        self.rebase_paths(&old_path, &new_path);
         self.hide(&old_path).await?;
         self.hide(&new_path).await
     }
