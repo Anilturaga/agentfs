@@ -2,15 +2,18 @@ pub mod connection_pool;
 pub mod error;
 pub mod filesystem;
 pub mod kvstore;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod overlay;
 pub mod schema;
 pub mod toolcalls;
 
 use error::{Error, Result};
 use std::{
-    collections::{HashSet, VecDeque},
+    any::Any,
     path::{Path, PathBuf},
+    sync::Arc,
 };
-use turso::{Builder, EncryptionOpts, Value};
+use turso::{Builder, EncryptionOpts};
 
 // Re-export turso sync types for CLI usage
 pub use turso::sync::{DatabaseSyncStats, PartialBootstrapStrategy, PartialSyncOpts};
@@ -19,13 +22,38 @@ pub use turso::sync::{DatabaseSyncStats, PartialBootstrapStrategy, PartialSyncOp
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use filesystem::HostFS;
 pub use filesystem::{
-    BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, OverlayFS, Stats, TimeChange,
-    DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT,
-    S_IFREG, S_IFSOCK,
+    BoxedFile, Change, DirEntry, File, FileSystem, FilesystemStats, FsError, OverlayFS, PathFS,
+    Stats, TimeChange, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
+    S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
 };
 pub use kvstore::KvStore;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use overlay::{
+    create_overlay, delete_overlay, list_overlays, open_merged, rebind_overlay, Base, MergedFS,
+    OverlayInfo,
+};
 pub use schema::{SchemaVersion, AGENTFS_SCHEMA_VERSION};
 pub use toolcalls::{ToolCall, ToolCallStats, ToolCallStatus, ToolCalls};
+
+/// Open the local database file at `path` with turso. The caller owns the file's reservation.
+pub(crate) async fn open_local(
+    path: &str,
+    enc: Option<&EncryptionConfig>,
+) -> Result<turso::Database> {
+    Ok(match enc {
+        Some(enc) => {
+            Builder::new_local(path)
+                .experimental_encryption(true)
+                .with_encryption(EncryptionOpts {
+                    cipher: enc.cipher.clone(),
+                    hexkey: enc.hex_key.clone(),
+                })
+                .build()
+                .await?
+        }
+        None => Builder::new_local(path).build().await?,
+    })
+}
 
 /// Directory containing agentfs databases
 pub fn agentfs_dir() -> &'static std::path::Path {
@@ -289,6 +317,14 @@ impl AgentFS {
     /// # }
     /// ```
     pub async fn open(options: AgentFSOptions) -> Result<Self> {
+        Self::open_held(options, None).await
+    }
+
+    /// Like `open`, with the database file already reserved by the caller as `held`.
+    pub(crate) async fn open_held(
+        options: AgentFSOptions,
+        held: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> Result<Self> {
         // Validate base directory if provided
         if let Some(ref path) = options.base {
             if !path.exists() {
@@ -309,6 +345,14 @@ impl AgentFS {
         let db_path = options.db_path()?;
         let meta_path = format!("{db_path}-info");
 
+        // Every engine open of a file on disk goes behind a reservation. A new synced
+        // database has no file yet, and the engine creates it.
+        let held = match held {
+            None if options.sync.remote_url.is_some() && !Path::new(&db_path).exists() => None,
+            None => connection_pool::ConnectionPool::reserve(&db_path)?,
+            held => held,
+        };
+
         // Determine if this is a synced database:
         // 1. If sync.remote_url is set, create a new synced database
         // 2. If {path}-info file exists, open as existing synced database
@@ -325,6 +369,7 @@ impl AgentFS {
             }
             let db = builder.build().await?;
             let pool = connection_pool::ConnectionPool::new_sync(db.clone());
+            held.into_iter().for_each(|held| pool.hold(held));
             (Some(db), pool)
         } else if std::fs::exists(&meta_path).unwrap_or(false) {
             let mut builder = turso::sync::Builder::new_remote(&db_path);
@@ -333,22 +378,14 @@ impl AgentFS {
             }
             let db = builder.build().await?;
             let pool = connection_pool::ConnectionPool::new_sync(db.clone());
+            held.into_iter().for_each(|held| pool.hold(held));
             (Some(db), pool)
         } else {
-            let db = if let Some(ref enc_config) = options.encryption {
-                Builder::new_local(&db_path)
-                    .experimental_encryption(true)
-                    .with_encryption(EncryptionOpts {
-                        cipher: enc_config.cipher.clone(),
-                        hexkey: enc_config.hex_key.clone(),
-                    })
-                    .build()
-                    .await?
-            } else {
-                Builder::new_local(&db_path).build().await?
-            };
-            let pool = connection_pool::ConnectionPool::new(db);
-            (None, pool)
+            let enc = options.encryption.as_ref();
+            (
+                None,
+                connection_pool::ConnectionPool::open_held(&db_path, enc, held).await?,
+            )
         };
 
         // Check schema version for existing databases
@@ -412,8 +449,7 @@ impl AgentFS {
         note = "Use AgentFS::open with AgentFSOptions instead"
     )]
     pub async fn new(db_path: &str) -> Result<Self> {
-        let db = Builder::new_local(db_path).build().await?;
-        let pool = connection_pool::ConnectionPool::new(db);
+        let pool = connection_pool::ConnectionPool::open_local(db_path, None).await?;
         Self::open_with_pool(pool, None).await
     }
 
@@ -463,197 +499,6 @@ impl AgentFS {
         let db = self.sync_db.as_ref().ok_or(Error::SyncNotEnabled)?;
         let stats = db.stats().await?;
         Ok(stats)
-    }
-
-    /// Get all paths in the delta layer (files in fs_dentry)
-    ///
-    /// This returns all file and directory paths that exist in the overlay's
-    /// delta layer, which represents files that have been added or modified.
-    pub async fn get_delta_paths(&self) -> Result<HashSet<String>> {
-        const ROOT_INO: i64 = 1;
-        let conn = self.pool.get_connection().await?;
-
-        let mut paths = HashSet::new();
-        let mut queue: VecDeque<(i64, String)> = VecDeque::new();
-        queue.push_back((ROOT_INO, String::new()));
-
-        while let Some((parent_ino, prefix)) = queue.pop_front() {
-            let query = format!(
-                "SELECT d.name, d.ino, i.mode FROM fs_dentry d
-                 JOIN fs_inode i ON d.ino = i.ino
-                 WHERE d.parent_ino = {}
-                 ORDER BY d.name",
-                parent_ino
-            );
-
-            let mut rows = conn.query(&query, ()).await?;
-
-            while let Some(row) = rows.next().await? {
-                let name: String = row
-                    .get_value(0)
-                    .ok()
-                    .and_then(|v| {
-                        if let Value::Text(s) = v {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-
-                let ino: i64 = row
-                    .get_value(1)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0);
-
-                let mode: u32 = row
-                    .get_value(2)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32;
-
-                let full_path = if prefix.is_empty() {
-                    format!("/{}", name)
-                } else {
-                    format!("{}/{}", prefix, name)
-                };
-
-                paths.insert(full_path.clone());
-
-                let is_dir = mode & S_IFMT == S_IFDIR;
-                if is_dir {
-                    queue.push_back((ino, full_path));
-                }
-            }
-        }
-
-        Ok(paths)
-    }
-
-    /// Get the file mode for a path in the delta layer
-    ///
-    /// Returns the mode (file type and permissions) for a path, or None if
-    /// the path doesn't exist in the delta layer.
-    pub async fn get_file_mode(&self, path: &str) -> Result<Option<u32>> {
-        const ROOT_INO: i64 = 1;
-        let conn = self.pool.get_connection().await?;
-
-        // Resolve path to inode
-        let components: Vec<&str> = path
-            .trim_start_matches('/')
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if components.is_empty() {
-            // Root directory
-            let mut rows = conn
-                .query("SELECT mode FROM fs_inode WHERE ino = ?", (ROOT_INO,))
-                .await?;
-
-            if let Some(row) = rows.next().await? {
-                let mode = row
-                    .get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0) as u32;
-                return Ok(Some(mode));
-            }
-            return Ok(None);
-        }
-
-        let mut current_ino = ROOT_INO;
-        for component in &components {
-            let query = format!(
-                "SELECT ino FROM fs_dentry WHERE parent_ino = {} AND name = '{}'",
-                current_ino, component
-            );
-
-            let mut rows = conn.query(&query, ()).await?;
-
-            if let Some(row) = rows.next().await? {
-                current_ino = row
-                    .get_value(0)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .unwrap_or(0);
-            } else {
-                return Ok(None);
-            }
-        }
-
-        let mut rows = conn
-            .query("SELECT mode FROM fs_inode WHERE ino = ?", (current_ino,))
-            .await?;
-
-        if let Some(row) = rows.next().await? {
-            let mode = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-            return Ok(Some(mode));
-        }
-
-        Ok(None)
-    }
-
-    /// Get all whiteouts (deleted paths from base layer)
-    ///
-    /// Whiteouts mark paths that existed in the base layer but have been
-    /// deleted in the overlay.
-    pub async fn get_whiteouts(&self) -> Result<HashSet<String>> {
-        let conn = self.pool.get_connection().await?;
-        let mut whiteouts = HashSet::new();
-
-        let result = conn.query("SELECT path FROM fs_whiteout", ()).await;
-
-        if let Ok(mut rows) = result {
-            while let Some(row) = rows.next().await? {
-                if let Ok(Value::Text(path)) = row.get_value(0) {
-                    whiteouts.insert(path.clone());
-                }
-            }
-        } // Err case: Table doesn't exist, return empty set
-
-        Ok(whiteouts)
-    }
-
-    /// Check if overlay is enabled for this filesystem
-    ///
-    /// Returns the base path if overlay is enabled, None otherwise.
-    pub async fn is_overlay_enabled(&self) -> Result<Option<String>> {
-        let conn = self.pool.get_connection().await?;
-        // Check if fs_overlay_config table exists and has base_path
-        let result = conn
-            .query(
-                "SELECT value FROM fs_overlay_config WHERE key = 'base_path'",
-                (),
-            )
-            .await;
-
-        match result {
-            Ok(mut rows) => {
-                if let Some(row) = rows.next().await? {
-                    let base_path: String = row
-                        .get_value(0)
-                        .ok()
-                        .and_then(|v| {
-                            if let Value::Text(s) = v {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_default();
-                    Ok(Some(base_path))
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(_) => Ok(None), // Table doesn't exist
-        }
     }
 }
 

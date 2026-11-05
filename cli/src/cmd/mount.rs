@@ -1,13 +1,11 @@
-use agentfs_sdk::{error::Error as SdkError, AgentFSOptions, FileSystem, HostFS, OverlayFS};
+use agentfs_sdk::error::Error as SdkError;
 use anyhow::{Context, Result};
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
 };
-use tokio::sync::Mutex;
-use turso::value::Value;
 
+use crate::cmd::init::{open_fs, resolve_db};
 use crate::mount::{mount_fs, MountOpts};
 use crate::nfs::AgentNFS;
 use crate::nfsserve::tcp::NFSTcp;
@@ -21,9 +19,13 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use crate::cmd::init::open_agentfs;
+use crate::cmd::init::Opened;
 #[cfg(target_os = "linux")]
 use crate::fuse::FuseMountOptions;
+#[cfg(target_os = "linux")]
+use agentfs_sdk::{Base, FileSystem, HostFS};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 
 pub use crate::opts::MountBackend;
 
@@ -85,7 +87,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
 /// Mount the agent filesystem using FUSE (Linux only).
 #[cfg(target_os = "linux")]
 fn mount_fuse(args: MountArgs) -> Result<()> {
-    let opts = AgentFSOptions::resolve(&args.id_or_path)?;
+    let opts = resolve_db(&args.id_or_path, None)?;
 
     // Check schema version before daemonizing. This allows us to show the error
     // message to the user directly, rather than having it appear in daemon logs.
@@ -135,50 +137,29 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
     let id_or_path = args.id_or_path.clone();
     let mount = move || {
         let rt = crate::get_runtime();
-        let agentfs = match rt.block_on(open_agentfs(opts)) {
-            Ok(fs) => fs,
-            Err(SdkError::SchemaVersionMismatch { found, expected }) => {
-                exit_schema_version_mismatch(&found, &expected, &id_or_path);
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        // Check for overlay configuration
         let fs: Arc<dyn FileSystem> = rt.block_on(async {
-            // Query base_path in a separate scope so connection is released
-            let base_path: Option<String> = {
-                let conn = agentfs.get_connection().await?;
-                let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
-                match conn.query(query, ()).await {
-                    Ok(mut rows) => {
-                        if let Ok(Some(row)) = rows.next().await {
-                            row.get_value(0).ok().and_then(|v| {
-                                if let Value::Text(s) = v {
-                                    Some(s.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                    Err(_) => None, // Table doesn't exist or query failed
+            let mut opened = match open_fs(opts.clone(), None).await {
+                Ok(opened) => opened,
+                Err(SdkError::SchemaVersionMismatch { found, expected }) => {
+                    exit_schema_version_mismatch(&found, &expected, &id_or_path);
                 }
-            }; // conn is dropped here
-
-            if let Some(base_path) = base_path {
-                // Create OverlayFS with HostFS base, loading existing whiteouts
-                eprintln!("Using overlay filesystem with base: {}", base_path);
-                let hostfs = HostFS::new(&base_path)?;
-                let hostfs = hostfs.with_fuse_mountpoint(mountpoint_ino);
-                let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
-                overlay.load().await?;
-                Ok::<Arc<dyn FileSystem>, anyhow::Error>(Arc::new(overlay))
-            } else {
-                // Plain AgentFS
-                Ok(Arc::new(agentfs.fs) as Arc<dyn FileSystem>)
+                Err(e) => return Err(e.into()),
+            };
+            // The base is read through a view that hides the mountpoint, which may lie inside it
+            if let Opened::Merged(merged) = &opened {
+                let recorded = Base::host(&merged.info().base_path)?;
+                let hostfs = HostFS::new(&recorded.path)?.with_fuse_mountpoint(mountpoint_ino);
+                let base = Base {
+                    fs: Arc::new(hostfs),
+                    ..recorded
+                };
+                drop(opened);
+                opened = open_fs(opts, Some(base)).await?;
             }
+            if let Some(base) = opened.base() {
+                eprintln!("Using overlay filesystem with base: {}", base);
+            }
+            Ok::<_, anyhow::Error>(opened.arc())
         })?;
 
         crate::fuse::mount(fs, fuse_opts, rt)
@@ -197,9 +178,7 @@ fn mount_fuse(args: MountArgs) -> Result<()> {
 
 /// Mount the agent filesystem using NFS over localhost.
 async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
-    use crate::cmd::init::open_agentfs;
-
-    let opts = AgentFSOptions::resolve(&args.id_or_path)?;
+    let opts = resolve_db(&args.id_or_path, None)?;
 
     if !args.mountpoint.exists() {
         anyhow::bail!("Mountpoint does not exist: {}", args.mountpoint.display());
@@ -214,49 +193,17 @@ async fn mount_nfs_backend(args: MountArgs) -> Result<()> {
             .unwrap_or_else(|_| args.id_or_path.clone())
     );
 
-    // Open AgentFS
-    let agentfs = match open_agentfs(opts).await {
-        Ok(fs) => fs,
+    let opened = match open_fs(opts, None).await {
+        Ok(opened) => opened,
         Err(SdkError::SchemaVersionMismatch { found, expected }) => {
             exit_schema_version_mismatch(&found, &expected, &args.id_or_path);
         }
         Err(e) => return Err(e.into()),
     };
-
-    // Check for overlay configuration
-    // Query base_path in a separate scope so connection is released before load_whiteouts
-    let base_path: Option<String> = {
-        let conn = agentfs.get_connection().await?;
-        let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
-        match conn.query(query, ()).await {
-            Ok(mut rows) => {
-                if let Ok(Some(row)) = rows.next().await {
-                    row.get_value(0).ok().and_then(|v| {
-                        if let Value::Text(s) = v {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                }
-            }
-            Err(_) => None, // Table doesn't exist or query failed
-        }
-    }; // conn is dropped here
-
-    let fs: Arc<Mutex<dyn FileSystem + Send>> = if let Some(base_path) = base_path {
-        // Create OverlayFS with HostFS base, loading existing whiteouts
-        eprintln!("Using overlay filesystem with base: {}", base_path);
-        let hostfs = HostFS::new(&base_path)?;
-        let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
-        overlay.load().await?;
-        Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
-    } else {
-        // Plain AgentFS
-        Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>
-    };
+    if let Some(base) = opened.base() {
+        eprintln!("Using overlay filesystem with base: {}", base);
+    }
+    let fs = opened.mutex();
 
     if args.foreground {
         // Use the unified mount API for foreground mode

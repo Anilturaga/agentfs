@@ -4,11 +4,16 @@
 //! connections with a maximum limit. When the pool is exhausted, callers block
 //! until a connection becomes available or timeout occurs.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    any::Any,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use turso::{Connection, Database};
 
 use crate::error::{Error, Result};
+use crate::EncryptionConfig;
 
 /// Maximum number of connections in the pool.
 const MAX_CONNECTIONS: usize = 1;
@@ -40,6 +45,8 @@ struct ConnectionPoolInner {
     semaphore: Arc<Semaphore>,
     /// Timeout for acquiring a connection
     timeout: Duration,
+    /// Dropped after every field above, so the database closes first
+    keep: OnceLock<Arc<dyn Any + Send + Sync>>,
 }
 
 impl ConnectionPool {
@@ -61,8 +68,38 @@ impl ConnectionPool {
                 pool: Mutex::new(Vec::new()),
                 semaphore: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
                 timeout,
+                keep: OnceLock::new(),
             }),
         }
+    }
+
+    /// Keep `held` alive until the pool, and every handle that shares it, is gone.
+    pub(crate) fn hold(&self, held: Arc<dyn Any + Send + Sync>) {
+        let _ = self.inner.keep.set(held);
+    }
+
+    /// Reserve the file at `path`, creating it if absent. `None` for an in-memory database.
+    pub(crate) fn reserve(path: &str) -> Result<Option<Arc<dyn Any + Send + Sync>>> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if path != ":memory:" {
+            let held = crate::overlay::Reservation::acquire_or_create(path)?;
+            return Ok(Some(Arc::new(held)));
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn open_held(
+        path: &str,
+        enc: Option<&EncryptionConfig>,
+        held: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> Result<Self> {
+        let pool = Self::new(crate::open_local(path, enc).await?);
+        held.into_iter().for_each(|held| pool.hold(held));
+        Ok(pool)
+    }
+
+    pub(crate) async fn open_local(path: &str, enc: Option<&EncryptionConfig>) -> Result<Self> {
+        Self::open_held(path, enc, Self::reserve(path)?).await
     }
 
     /// Get a connection from the pool.

@@ -634,7 +634,7 @@ SDK path resolution walks the merged view one component at a time.
 - For a local database file, the engine's exclusive file lock (turso takes it on each read-write open) enforces the rule across processes. The SDK MUST also refuse a second open of the same file in its own process.
 - Storage that serializes access by construction (for example a Cloudflare Durable Object) satisfies the rule.
 - An overlay on storage that allows concurrent clients without a lock (for example a remote serverless database) fails to open with `ENOTSUP`.
-- `listOverlays` reads `fs_overlay_config` without the lock. `deleteOverlay` takes the lock first.
+- `listOverlays` reads `fs_overlay_config` without the lock. Where the storage engine has no lock-free read (the Rust SDK on turso 0.4.4), `listOverlays` takes the lock for each read instead, and MAY omit a database that another instance holds open. `deleteOverlay` takes the lock first.
 
 ### Versioning and Migration
 
@@ -869,6 +869,7 @@ Such extensions SHOULD use separate tables to maintain referential integrity.
 - `deleteOverlay` also deletes the `-log`, `-wal-revert` and `-changes` engine sidecars
 - A write or truncate through a handle whose lower-backed entry was removed or replaced before copy-up fails with `ENOENT`
 - Conformance case 6 is the spec trace again; its `ino` assertion is now case 42
+- `listOverlays` reads without the lock only where the storage engine allows it. Where it does not (the Rust SDK on turso 0.4.4), it takes the lock for each read and MAY omit a database that another instance holds open
 - The overlay format version stays 1 and the schema does not change
 
 ### Overlay Format v1

@@ -1,7 +1,6 @@
 use crate::connection_pool::ConnectionPool;
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
-use turso::Builder;
 
 /// A key-value store backed by SQLite
 #[derive(Clone)]
@@ -12,8 +11,7 @@ pub struct KvStore {
 impl KvStore {
     /// Create a new KV store
     pub async fn new(db_path: &str) -> Result<Self> {
-        let db = Builder::new_local(db_path).build().await?;
-        let pool = ConnectionPool::new(db);
+        let pool = ConnectionPool::open_local(db_path, None).await?;
         let kv = Self { pool };
         kv.initialize().await?;
         Ok(kv)

@@ -4,15 +4,11 @@
 //! filesystem to a temporary directory, runs a command with that as the
 //! working directory, and automatically unmounts when done.
 
-use agentfs_sdk::{AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use turso::value::Value;
 
-use crate::cmd::init::open_agentfs;
+use crate::cmd::init::{open_fs, resolve_db};
 use crate::mount::{mount_fs, MountBackend, MountOpts};
 
 /// Handle the exec command.
@@ -25,51 +21,11 @@ pub async fn handle_exec_command(
     backend: MountBackend,
     encryption: Option<(String, String)>,
 ) -> Result<()> {
-    // Resolve AgentFS options
-    let mut opts = AgentFSOptions::resolve(&id_or_path)?;
-    if let Some((key, cipher)) = encryption {
-        opts = opts.with_encryption(EncryptionConfig {
-            hex_key: key,
-            cipher,
-        });
+    let opened = open_fs(resolve_db(&id_or_path, encryption.as_ref())?, None).await?;
+    if let Some(base) = opened.base() {
+        eprintln!("Using overlay filesystem with base: {}", base);
     }
-
-    // Open AgentFS
-    let agentfs = open_agentfs(opts).await?;
-
-    // Check for overlay configuration
-    let fs: Arc<Mutex<dyn FileSystem + Send>> = {
-        let conn = agentfs.get_connection().await?;
-
-        // Check if fs_overlay_config table exists and has base_path
-        let query = "SELECT value FROM fs_overlay_config WHERE key = 'base_path'";
-        let base_path: Option<String> = match conn.query(query, ()).await {
-            Ok(mut rows) => {
-                if let Ok(Some(row)) = rows.next().await {
-                    row.get_value(0).ok().and_then(|v| {
-                        if let Value::Text(s) = v {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
-        };
-
-        if let Some(base_path) = base_path {
-            eprintln!("Using overlay filesystem with base: {}", base_path);
-            let hostfs = HostFS::new(&base_path)?;
-            let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
-            overlay.load().await?;
-            Arc::new(Mutex::new(overlay)) as Arc<Mutex<dyn FileSystem + Send>>
-        } else {
-            Arc::new(Mutex::new(agentfs.fs)) as Arc<Mutex<dyn FileSystem + Send>>
-        }
-    };
+    let fs = opened.mutex();
 
     // Create a temporary directory for the mount
     let exec_id = uuid::Uuid::new_v4().to_string();

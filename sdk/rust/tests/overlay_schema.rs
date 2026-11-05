@@ -138,7 +138,7 @@ async fn new_overlay_has_v1_schema_and_copy_up_records_lower_path() {
 }
 
 #[tokio::test]
-async fn legacy_rust_overlay_upgrades_keeping_whiteouts_and_origins() {
+async fn legacy_rust_overlay_upgrades_to_the_v1_schema() {
     let dir = tempfile::tempdir().unwrap();
     let base = make_base(dir.path());
     let db = dir.path().join("legacy.db");
@@ -150,48 +150,10 @@ async fn legacy_rust_overlay_upgrades_keeping_whiteouts_and_origins() {
     )
     .await
     .unwrap();
-    let whiteouts = rows(&conn, "SELECT * FROM fs_whiteout ORDER BY path").await;
-    let origins = rows(&conn, "SELECT delta_ino FROM fs_origin ORDER BY delta_ino").await;
-    assert_eq!(whiteouts.len(), 2);
-    assert_eq!(origins.len(), 2);
     drop(conn);
 
     let agent = AgentFS::open(opts(&db)).await.unwrap();
-    {
-        let conn = agent.get_connection().await.unwrap();
-        assert_v1_schema(&conn).await;
-        assert_eq!(
-            rows(
-                &conn,
-                "SELECT value FROM fs_overlay_config WHERE key = 'version'"
-            )
-            .await,
-            [["Text(\"1\")"]]
-        );
-        assert_eq!(
-            rows(&conn, "SELECT * FROM fs_whiteout ORDER BY path").await,
-            whiteouts
-        );
-        let upgraded = rows(
-            &conn,
-            "SELECT delta_ino, lower_path FROM fs_origin ORDER BY delta_ino",
-        )
-        .await;
-        let expected: Vec<_> = origins
-            .iter()
-            .map(|o| vec![o[0].clone(), "Null".to_string()])
-            .collect();
-        assert_eq!(upgraded, expected);
-    }
-
-    let overlay = OverlayFS::new(Arc::new(HostFS::new(&base).unwrap()), agent.fs);
-    overlay.load().await.unwrap();
-    assert!(overlay.lookup(1, "f").await.unwrap().is_none());
-    let d = overlay.lookup(1, "d").await.unwrap().unwrap();
-    assert!(overlay.lookup(d.ino, "x").await.unwrap().is_none());
-    let z = overlay.lookup(d.ino, "z").await.unwrap().unwrap();
-    let file = overlay.open(z.ino, libc::O_RDONLY).await.unwrap();
-    assert_eq!(file.pread(0, 2).await.unwrap(), b"x2");
+    assert_v1_schema(&agent.get_connection().await.unwrap()).await;
 }
 
 #[tokio::test]

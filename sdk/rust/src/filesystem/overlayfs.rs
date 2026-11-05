@@ -30,6 +30,47 @@ fn errno(code: i32) -> Error {
     std::io::Error::from_raw_os_error(code).into()
 }
 
+/// Identity of the host directory `path`: `host:<st_dev>:<st_ino>`.
+pub(crate) fn host_identity(path: &str) -> Result<String> {
+    let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Error::BaseDirectoryNotFound(path.to_string()),
+        _ => e.into(),
+    })?;
+    Ok(format!("host:{}:{}", meta.dev(), meta.ino()))
+}
+
+/// A path whose entry differs between the base and the merged view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    /// `A` added, `M` modified, `D` deleted
+    pub change: char,
+    /// `f` file, `d` directory, `l` symlink, `?` other
+    pub file_type: char,
+    pub path: String,
+}
+
+impl Change {
+    fn new(change: char, stats: &Stats, path: String) -> Self {
+        let file_type = match stats.mode & super::S_IFMT {
+            super::S_IFREG => 'f',
+            super::S_IFDIR => 'd',
+            super::S_IFLNK => 'l',
+            _ => '?',
+        };
+        Self {
+            change,
+            file_type,
+            path,
+        }
+    }
+}
+
+impl std::fmt::Display for Change {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {} {}", self.change, self.file_type, self.path)
+    }
+}
+
 /// FIFOs, devices and sockets: a lower one is never opened or copied up.
 fn is_special(stats: &Stats) -> bool {
     !(stats.is_file() || stats.is_directory() || stats.is_symlink())
@@ -223,7 +264,7 @@ impl OverlayFS {
         }
     }
 
-    async fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    pub(crate) async fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
         let sql = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'");
         Ok(conn.query(&sql, ()).await?.next().await?.is_some())
     }
@@ -236,11 +277,7 @@ impl OverlayFS {
         if Self::check_version(conn).await? {
             return Ok(());
         }
-        let base = std::fs::metadata(base_path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => Error::BaseDirectoryNotFound(base_path.to_string()),
-            _ => e.into(),
-        })?;
-        let identity = format!("host:{}:{}", base.dev(), base.ino());
+        let identity = host_identity(base_path)?;
         conn.execute("BEGIN IMMEDIATE", ()).await?;
         match Self::migrate(conn, base_path, &identity).await {
             Ok(()) => conn.execute("COMMIT", ()).await.map(drop)?,
@@ -274,11 +311,19 @@ impl OverlayFS {
             (),
         )
         .await?;
-        for (key, value) in [
-            ("base_path", base_path),
-            ("base_identity", identity),
-            ("version", OVERLAY_VERSION),
-        ] {
+        Self::set_config(
+            conn,
+            &[
+                ("base_path", base_path),
+                ("base_identity", identity),
+                ("version", OVERLAY_VERSION),
+            ],
+        )
+        .await
+    }
+
+    pub(crate) async fn set_config(conn: &Connection, rows: &[(&str, &str)]) -> Result<()> {
+        for (key, value) in rows {
             conn.execute(
                 "INSERT OR REPLACE INTO fs_overlay_config (key, value) VALUES (?1, ?2)",
                 [key.to_string(), value.to_string()],
@@ -322,6 +367,99 @@ impl OverlayFS {
         self.load_whiteouts(&conn).await
     }
 
+    /// The changes between the base and the merged view, sorted by path. Reads the delta,
+    /// the whiteouts loaded by `load` and only the base entries that can differ. Writes nothing.
+    pub async fn diff(&self) -> Result<Vec<Change>> {
+        let mut out = Vec::new();
+        let mut walk = vec![(ROOT_INO, Some(ROOT_INO), String::new())];
+        while let Some((dir, lower, path)) = walk.pop() {
+            for e in FileSystem::readdir_plus(&self.delta, dir)
+                .await?
+                .unwrap_or_default()
+            {
+                let p = format!("{path}/{}", e.name);
+                let b = match lower {
+                    Some(l) => self.base.lookup(l, &e.name).await?,
+                    None => None,
+                };
+                out.push(Change::new(
+                    if b.is_some() { 'M' } else { 'A' },
+                    &e.stats,
+                    p.clone(),
+                ));
+                match b {
+                    _ if e.stats.is_directory() => {
+                        let lower = b.filter(Stats::is_directory).map(|b| b.ino);
+                        walk.push((e.stats.ino, lower, p));
+                    }
+                    Some(b) if b.is_directory() => {
+                        self.deleted_below(None, b.ino, &p, &mut out).await?
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let whiteouts = self.whiteouts.read().unwrap().clone();
+        for w in &whiteouts {
+            let parent = w.rsplit_once('/').map_or("", |(parent, _)| parent);
+            if self.is_whiteout(parent) {
+                continue;
+            }
+            let Some(b) = self.lower_stat(w).await? else {
+                continue;
+            };
+            match self.delta.lstat(w).await? {
+                None => {
+                    out.push(Change::new('D', &b, w.clone()));
+                    if b.is_directory() {
+                        self.deleted_below(None, b.ino, w, &mut out).await?;
+                    }
+                }
+                Some(d) if d.is_directory() && b.is_directory() => {
+                    self.deleted_below(Some(d.ino), b.ino, w, &mut out).await?
+                }
+                Some(_) => {}
+            }
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Add a deletion for each entry below the base directory `lower` that the delta directory
+    /// `delta` does not hold, or for every entry without one.
+    async fn deleted_below(
+        &self,
+        delta: Option<i64>,
+        lower: i64,
+        path: &str,
+        out: &mut Vec<Change>,
+    ) -> Result<()> {
+        let mut walk = vec![(delta, lower, path.to_string())];
+        while let Some((delta, lower, path)) = walk.pop() {
+            for c in self.base.readdir_plus(lower).await?.unwrap_or_default() {
+                let p = format!("{path}/{}", c.name);
+                let held = match delta {
+                    Some(d) => FileSystem::lookup(&self.delta, d, &c.name).await?,
+                    None => None,
+                };
+                match held {
+                    None => {
+                        out.push(Change::new('D', &c.stats, p.clone()));
+                        if c.stats.is_directory() {
+                            walk.push((None, c.stats.ino, p));
+                        }
+                    }
+                    Some(d) if d.is_directory() && c.stats.is_directory() => {
+                        walk.push((Some(d.ino), c.stats.ino, p))
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Check if a path is whiteout (deleted from base)
     fn is_whiteout(&self, path: &str) -> bool {
         let whiteouts = self.whiteouts.read().unwrap();
@@ -349,25 +487,22 @@ impl OverlayFS {
         Ok(())
     }
 
-    /// Base inode at `path`. `None` if the base has no entry there or a proper
+    /// Base entry at `path`. `None` if the base has no entry there or a proper
     /// ancestor is not a directory.
-    async fn lower_ino(&self, path: &str) -> Result<Option<i64>> {
-        let (mut ino, mut is_dir) = (ROOT_INO, true);
+    async fn lower_stat(&self, path: &str) -> Result<Option<Stats>> {
+        let mut stats = self.base.getattr(ROOT_INO).await?;
         for comp in path.split('/').filter(|s| !s.is_empty()) {
-            if !is_dir {
-                return Ok(None);
-            }
-            match self.base.lookup(ino, comp).await? {
-                Some(s) => (ino, is_dir) = (s.ino, s.is_directory()),
-                None => return Ok(None),
+            match stats {
+                Some(s) if s.is_directory() => stats = self.base.lookup(s.ino, comp).await?,
+                _ => return Ok(None),
             }
         }
-        Ok(Some(ino))
+        Ok(stats)
     }
 
     /// Hide the base entry at `path` unless a whiteout already covers it
     async fn hide(&self, path: &str) -> Result<()> {
-        if !self.is_whiteout(path) && self.lower_ino(path).await?.is_some() {
+        if !self.is_whiteout(path) && self.lower_stat(path).await?.is_some() {
             self.create_whiteout(path).await?;
         }
         Ok(())
@@ -484,7 +619,7 @@ impl OverlayFS {
         if info.layer == Layer::Base {
             return Ok(Some(info.underlying_ino));
         }
-        self.lower_ino(&info.path).await
+        Ok(self.lower_stat(&info.path).await?.map(|s| s.ino))
     }
 
     /// Get inode info for an overlay inode
@@ -1424,7 +1559,7 @@ impl FileSystem for OverlayFS {
                     self.copy_up_and_update_mapping(stats.ino).await?;
                 }
                 _ => {
-                    let base_ino = self.lower_ino(&path).await?.ok_or(FsError::NotFound)?;
+                    let base_ino = self.lower_stat(&path).await?.ok_or(FsError::NotFound)?.ino;
                     let _promoting = self.promote.lock().await;
                     self.copy_up(&path, base_ino).await?;
                 }
@@ -2449,16 +2584,18 @@ mod tests {
         let db_path = delta_dir.path().join("delta.db");
 
         // Session 1: create delta file (creates origin mapping for /dir/)
-        let base = Arc::new(HostFS::new(base_dir.path())?);
-        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
-        let overlay = OverlayFS::new(base, delta);
-        overlay.init(base_dir.path().to_str().unwrap()).await?;
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
 
-        let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
-        let (_s, f) = overlay
-            .create_file(dir_stats.ino, "delta.txt", DEFAULT_FILE_MODE, 0, 0)
-            .await?;
-        f.pwrite(0, b"delta").await?;
+            let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
+            let (_s, f) = overlay
+                .create_file(dir_stats.ino, "delta.txt", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            f.pwrite(0, b"delta").await?;
+        }
 
         // Session 2: remount and verify base files are still accessible
         let base = Arc::new(HostFS::new(base_dir.path())?);
@@ -2548,16 +2685,18 @@ mod tests {
         let db_path = delta_dir.path().join("delta.db");
 
         // Session 1: create delta file (creates origin mapping for /dir/)
-        let base = Arc::new(HostFS::new(base_dir.path())?);
-        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
-        let overlay = OverlayFS::new(base, delta);
-        overlay.init(base_dir.path().to_str().unwrap()).await?;
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
 
-        let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
-        let (_s, f) = overlay
-            .create_file(dir_stats.ino, "delta.txt", DEFAULT_FILE_MODE, 0, 0)
-            .await?;
-        f.pwrite(0, b"delta").await?;
+            let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
+            let (_s, f) = overlay
+                .create_file(dir_stats.ino, "delta.txt", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            f.pwrite(0, b"delta").await?;
+        }
 
         // Session 2: remount and unlink the base file
         let base = Arc::new(HostFS::new(base_dir.path())?);
@@ -2765,15 +2904,17 @@ mod tests {
         let db_path = delta_dir.path().join("delta.db");
 
         // Session 1: copy-up file.txt to delta via write
-        let base = Arc::new(HostFS::new(base_dir.path())?);
-        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
-        let overlay = OverlayFS::new(base, delta);
-        overlay.init(base_dir.path().to_str().unwrap()).await?;
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
 
-        let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
-        let file_stats = overlay.lookup(dir_stats.ino, "file.txt").await?.unwrap();
-        let file = overlay.open(file_stats.ino, libc::O_WRONLY).await?;
-        file.pwrite(0, b"modified in delta").await?;
+            let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
+            let file_stats = overlay.lookup(dir_stats.ino, "file.txt").await?.unwrap();
+            let file = overlay.open(file_stats.ino, libc::O_WRONLY).await?;
+            file.pwrite(0, b"modified in delta").await?;
+        }
 
         // Session 2: remount, unlink, recreate, verify new content
         let base = Arc::new(HostFS::new(base_dir.path())?);
@@ -2810,18 +2951,20 @@ mod tests {
         let db_path = delta_dir.path().join("delta.db");
 
         // Session 1: creating src.txt copies up its parent; then link it
-        let base = Arc::new(HostFS::new(base_dir.path())?);
-        let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
-        let overlay = OverlayFS::new(base, delta);
-        overlay.init(base_dir.path().to_str().unwrap()).await?;
+        {
+            let base = Arc::new(HostFS::new(base_dir.path())?);
+            let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
+            let overlay = OverlayFS::new(base, delta);
+            overlay.init(base_dir.path().to_str().unwrap()).await?;
 
-        let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
-        let (src_stats, _) = overlay
-            .create_file(dir_stats.ino, "src.txt", DEFAULT_FILE_MODE, 0, 0)
-            .await?;
-        overlay
-            .link(src_stats.ino, dir_stats.ino, "dst.txt")
-            .await?;
+            let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
+            let (src_stats, _) = overlay
+                .create_file(dir_stats.ino, "src.txt", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            overlay
+                .link(src_stats.ino, dir_stats.ino, "dst.txt")
+                .await?;
+        }
 
         // Session 2: remount, unlink source, verify link survives
         let base = Arc::new(HostFS::new(base_dir.path())?);
@@ -3147,6 +3290,7 @@ mod tests {
         let overlay = open_overlay(base_dir.path(), &db).await?;
         overlay.lookup(ROOT_INO, "d").await?.unwrap();
         overlay.rename(ROOT_INO, "d", ROOT_INO, "m").await?;
+        drop(overlay);
 
         let overlay = open_overlay(base_dir.path(), &db).await?;
         let moved = overlay.lookup(ROOT_INO, "m").await?.unwrap();
@@ -3183,7 +3327,12 @@ mod tests {
         overlay.chmod(x.ino, 0o600).await?;
         overlay.rename(ROOT_INO, "d", ROOT_INO, "m").await?;
 
-        for overlay in [overlay, open_overlay(base_dir.path(), &db).await?] {
+        let mut live = Some(overlay);
+        for _ in 0..2 {
+            let overlay = match live.take() {
+                Some(overlay) => overlay,
+                None => open_overlay(base_dir.path(), &db).await?,
+            };
             let m = overlay.lookup(ROOT_INO, "m").await?.unwrap();
             assert_eq!(overlay.readdir(m.ino).await?.unwrap(), ["x", "x2"]);
             assert_eq!(mode_of(&overlay, m.ino, "x").await?, 0o600);
@@ -3208,8 +3357,12 @@ mod tests {
         assert_ne!(x.ino, x2.ino);
         overlay.chmod(x.ino, 0o600).await?;
 
-        let reopened = open_overlay(base_dir.path(), &db).await?;
-        for overlay in [overlay, reopened] {
+        let mut live = Some(overlay);
+        for _ in 0..2 {
+            let overlay = match live.take() {
+                Some(overlay) => overlay,
+                None => open_overlay(base_dir.path(), &db).await?,
+            };
             let m = overlay.lookup(ROOT_INO, "m").await?.unwrap();
             assert_eq!(mode_of(&overlay, m.ino, "x").await?, 0o600);
             assert_ne!(mode_of(&overlay, m.ino, "x2").await?, 0o600);
@@ -3232,7 +3385,12 @@ mod tests {
             overlay.chmod(x.ino, 0o600).await?;
             overlay.rename(d.ino, from, d.ino, to).await?;
 
-            for overlay in [overlay, open_overlay(base_dir.path(), &db).await?] {
+            let mut live = Some(overlay);
+            for _ in 0..2 {
+                let overlay = match live.take() {
+                    Some(overlay) => overlay,
+                    None => open_overlay(base_dir.path(), &db).await?,
+                };
                 let d = overlay.lookup(ROOT_INO, "d").await?.unwrap();
                 assert_eq!(overlay.readdir(d.ino).await?.unwrap(), [to]);
                 let lower = std::fs::metadata(base_dir.path().join("d/x2"))?;
@@ -3256,15 +3414,17 @@ mod tests {
         let delta_dir = tempdir()?;
         let db = delta_dir.path().join("delta.db");
 
-        let overlay = open_overlay(base_dir.path(), &db).await?;
-        let f = overlay.lookup(ROOT_INO, "f").await?.unwrap();
-        overlay.chmod(f.ino, 0o600).await?;
-        let file = overlay.open(f.ino, libc::O_RDWR).await?;
-        assert_eq!(file.fstat().await?.ino, f.ino);
-        let (made, file) = overlay
-            .create_file(ROOT_INO, "n", DEFAULT_FILE_MODE, 0, 0)
-            .await?;
-        assert_eq!(file.fstat().await?.ino, made.ino);
+        {
+            let overlay = open_overlay(base_dir.path(), &db).await?;
+            let f = overlay.lookup(ROOT_INO, "f").await?.unwrap();
+            overlay.chmod(f.ino, 0o600).await?;
+            let file = overlay.open(f.ino, libc::O_RDWR).await?;
+            assert_eq!(file.fstat().await?.ino, f.ino);
+            let (made, file) = overlay
+                .create_file(ROOT_INO, "n", DEFAULT_FILE_MODE, 0, 0)
+                .await?;
+            assert_eq!(file.fstat().await?.ino, made.ino);
+        }
 
         let overlay = open_overlay(base_dir.path(), &db).await?;
         let d = overlay.lookup(ROOT_INO, "d").await?.unwrap();
@@ -3330,6 +3490,8 @@ mod tests {
         let e = overlay.lookup(ROOT_INO, "e").await?.unwrap();
         overlay.mkdir(e.ino, "target", 0o755, 0, 0).await?;
         overlay.mkdir(ROOT_INO, "n", 0o755, 0, 0).await?;
+
+        drop(overlay);
 
         std::fs::remove_dir(base_dir.path().join("e"))?;
         std::fs::write(base_dir.path().join("e"), b"file")?;

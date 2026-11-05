@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use turso::transaction::{Transaction, TransactionBehavior};
-use turso::{Builder, Connection, Value};
+use turso::{Connection, Value};
 
 use super::{
     BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, Stats, TimeChange,
@@ -422,8 +422,7 @@ impl AgentFSFile {
 impl AgentFS {
     /// Create a new filesystem
     pub async fn new(db_path: &str) -> Result<Self> {
-        let db = Builder::new_local(db_path).build().await?;
-        Self::from_pool(ConnectionPool::new(db)).await
+        Self::from_pool(ConnectionPool::open_local(db_path, None).await?).await
     }
 
     /// Create a filesystem from a connection pool

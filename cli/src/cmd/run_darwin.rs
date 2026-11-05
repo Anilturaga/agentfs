@@ -9,13 +9,14 @@
 
 #![cfg(unix)]
 
-use agentfs_sdk::{AgentFS, AgentFSOptions, EncryptionConfig, FileSystem, HostFS, OverlayFS};
+use agentfs_sdk::{AgentFSOptions, Base, EncryptionConfig, FileSystem};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::cmd::init::open_session;
 use crate::nfs::AgentNFS;
 use crate::nfsserve::tcp::NFSTcp;
 
@@ -72,20 +73,11 @@ pub async fn run(
             cipher,
         });
     }
-    let agentfs = AgentFS::open(options)
+    let base = Base::host(&cwd).context("Failed to create HostFS")?;
+    let overlay = open_session(options, base)
         .await
-        .context("Failed to create AgentFS")?;
-
-    // Create overlay filesystem with CWD as base
-    let base_str = cwd.to_string_lossy().to_string();
-    let hostfs = HostFS::new(&base_str).context("Failed to create HostFS")?;
-    let overlay = OverlayFS::new(Arc::new(hostfs), agentfs.fs);
-
-    // Initialize the overlay (copies directory structure)
-    overlay
-        .init(&base_str)
-        .await
-        .context("Failed to initialize overlay")?;
+        .context("Failed to open the session overlay")?
+        .fs;
 
     let fs: Arc<Mutex<dyn FileSystem>> = Arc::new(Mutex::new(overlay));
 

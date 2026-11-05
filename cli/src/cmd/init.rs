@@ -1,11 +1,14 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentfs_sdk::{
-    agentfs_dir, AgentFS, AgentFSOptions, EncryptionConfig, OverlayFS, PartialBootstrapStrategy,
+    agentfs_dir, create_overlay, error::Error as SdkError, open_merged, AgentFS, AgentFSOptions,
+    Base, EncryptionConfig, FileSystem, KvStore, MergedFS, OverlayFS, PartialBootstrapStrategy,
     PartialSyncOpts, SyncOptions,
 };
 use anyhow::{Context, Result as AnyhowResult};
+use tokio::sync::Mutex;
 
 use crate::opts::{MountBackend, SyncCommandOptions};
 
@@ -16,15 +19,103 @@ pub struct EncryptionOptions {
     pub cipher: String,
 }
 
-pub async fn open_agentfs(options: AgentFSOptions) -> Result<AgentFS, agentfs_sdk::error::Error> {
-    let mut options = options;
-    // CLI handles env var fallback for auth token
+fn with_env_token(mut options: AgentFSOptions) -> AgentFSOptions {
     if options.sync.auth_token.is_none() {
-        if let Ok(auth_token) = std::env::var("TURSO_DB_AUTH_TOKEN") {
-            options.sync.auth_token = Some(auth_token);
+        options.sync.auth_token = std::env::var("TURSO_DB_AUTH_TOKEN").ok();
+    }
+    options
+}
+
+pub async fn open_agentfs(options: AgentFSOptions) -> Result<AgentFS, SdkError> {
+    AgentFS::open(with_env_token(options)).await
+}
+
+/// The database named by an agent ID, a path, or the ID of an `agentfs run` session.
+pub fn resolve_db(
+    id_or_path: &str,
+    encryption: Option<&(String, String)>,
+) -> AnyhowResult<AgentFSOptions> {
+    let session = dirs::home_dir()
+        .map(|home| home.join(".agentfs/run").join(id_or_path).join("delta.db"))
+        .filter(|db| AgentFSOptions::validate_agent_id(id_or_path) && db.is_file());
+    let mut options = match (AgentFSOptions::resolve(id_or_path), session) {
+        (Ok(options), _) => options,
+        (Err(_), Some(db)) => AgentFSOptions::with_path(db.to_string_lossy()),
+        (Err(e), None) => return Err(e.into()),
+    };
+    if let Some((key, cipher)) = encryption {
+        options = options.with_encryption(EncryptionConfig {
+            hex_key: key.clone(),
+            cipher: cipher.clone(),
+        });
+    }
+    Ok(options)
+}
+
+/// A database opened as an overlay when it is one, else as a plain filesystem.
+pub enum Opened {
+    Merged(MergedFS),
+    Plain(AgentFS),
+}
+
+impl Opened {
+    pub fn arc(&self) -> Arc<dyn FileSystem> {
+        match self {
+            Opened::Merged(m) => Arc::new(m.fs.clone()),
+            Opened::Plain(a) => Arc::new(a.fs.clone()),
         }
     }
-    AgentFS::open(options).await
+
+    pub fn mutex(&self) -> Arc<Mutex<dyn FileSystem + Send>> {
+        match self {
+            Opened::Merged(m) => Arc::new(Mutex::new(m.fs.clone())),
+            Opened::Plain(a) => Arc::new(Mutex::new(a.fs.clone())),
+        }
+    }
+
+    pub fn base(&self) -> Option<&str> {
+        match self {
+            Opened::Merged(m) => Some(&m.info().base_path),
+            Opened::Plain(_) => None,
+        }
+    }
+
+    pub fn kv(&self) -> &KvStore {
+        match self {
+            Opened::Merged(m) => &m.kv,
+            Opened::Plain(a) => &a.kv,
+        }
+    }
+}
+
+/// Open the database over `base`, or over the base it records. A database that is not an
+/// overlay, or does not exist yet, opens as a plain filesystem.
+pub async fn open_fs(options: AgentFSOptions, base: Option<Base>) -> Result<Opened, SdkError> {
+    let exists = options.db_path().is_ok_and(|db| Path::new(&db).exists());
+    if base.is_none() && !exists {
+        return Ok(Opened::Plain(open_agentfs(options).await?));
+    }
+    let given = base.is_some();
+    match open_merged(with_env_token(options.clone()), base).await {
+        Ok(merged) => Ok(Opened::Merged(merged)),
+        Err(SdkError::Overlay {
+            errno: libc::EINVAL,
+            ..
+        }) if !given => Ok(Opened::Plain(open_agentfs(options).await?)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Open the overlay of an `agentfs run` session over `base`, creating it on the first run.
+/// A later run over another directory fails with `ESTALE`.
+pub async fn open_session(options: AgentFSOptions, base: Base) -> Result<MergedFS, SdkError> {
+    if !options.db_path().is_ok_and(|db| Path::new(&db).exists()) {
+        match create_overlay(options.clone(), &base).await {
+            Err(e) if e.errno() != Some(libc::EEXIST) => return Err(e),
+            _ => {}
+        }
+    }
+    open_merged(options, Some(base)).await
 }
 
 pub fn build_sync_options(sync_cmd_options: &SyncCommandOptions) -> SyncOptions {
@@ -271,6 +362,22 @@ async fn run_init_cmd(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn open_session_from_another_cwd_is_estale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let options = AgentFSOptions::with_path(dir.path().join("delta.db").to_str().unwrap());
+
+        for _ in 0..2 {
+            let session = open_session(options.clone(), Base::host(&a).unwrap()).await;
+            assert!(session.is_ok());
+        }
+        let other = open_session(options, Base::host(&b).unwrap()).await;
+        assert_eq!(other.err().and_then(|e| e.errno()), Some(libc::ESTALE));
+    }
 
     #[tokio::test]
     async fn force_init_removes_only_target_agent_files() {
