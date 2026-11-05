@@ -461,7 +461,7 @@ class OverlayFS:
                 try:
                     found = (await self._walk(node.path, False, "open"))[2]
                 except ErrnoException as e:
-                    if e.code != "ENOTDIR":
+                    if e.code not in ("ENOTDIR", "ELOOP"):
                         raise
                     found = None
                 if found is None or found.ino != node.ino:

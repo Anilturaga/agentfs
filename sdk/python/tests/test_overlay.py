@@ -510,3 +510,15 @@ async def test_handle_on_unlinked_delta_file_is_enoent(overlay, base):
         await fs.unlink("/m")
         for attempt in (handle.pwrite(0, b"z"), handle.truncate(0), handle.pread(0, 1)):
             assert await code(attempt) == "ENOENT"
+
+
+async def test_handle_after_ancestor_became_symlink_loop_is_enoent(overlay, base):
+    async with await open_merged(overlay, base) as fs:
+        handle = await fs.open("/d/x")
+        await fs.rm("/d", recursive=True)
+        await fs.symlink("d", "/d")
+        assert await code(handle.pwrite(0, b"z")) == "ENOENT"
+        assert await code(handle.truncate(0)) == "ENOENT"
+        await fs.rm("/d")
+        await fs.symlink("f", "/d")
+        assert await code(handle.pwrite(0, b"z")) == "ENOENT"
