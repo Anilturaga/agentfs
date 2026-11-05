@@ -94,6 +94,7 @@ export class OverlayFS implements FileSystem {
   private nextIno = 2;
   private rootLower?: LowerStats;
   private closed = false;
+  private tail: Promise<unknown> = Promise.resolve();
 
   /** @internal Use `openMerged`. */
   constructor(
@@ -171,24 +172,31 @@ export class OverlayFS implements FileSystem {
   /**
    * Resolves `path` one component at a time. Symlinks at intermediate components are always
    * followed, the last one only if `followLast`. `node` is null when the last component is missing.
+   * `parent` and `name` locate the dentry of `node`; `name` is empty after a final `.` or `..`,
+   * and `dirOnly` is set when the path ends in `/`, `.` or `..`.
    */
   private async walk(path: string, followLast: boolean, syscall: FsSyscall) {
     const root = this.byDelta.get(1)!;
     const stack: Node[] = [{ entry: root, path: '/', lower: this.rootLower, stats: await this.stats(root) }];
     const parts = split(path);
     let node: Node | null = stack[0];
-    let name = '';
-    let links = 0;
+    let [parent, name, dirOnly, links] = [stack[0], '', false, 0];
     while (parts.length) {
-      name = parts.pop()!;
-      if (name === '' || name === '.' || name === '..') {
-        if (name === '..' && stack.length > 1) stack.pop();
+      const part = parts.pop()!;
+      if (part === '' || part === '.' || part === '..') {
+        if (part === '..' && stack.length > 1) stack.pop();
         node = stack[stack.length - 1];
+        if (part) name = '';
+        dirOnly = true;
         continue;
       }
-      node = await this.child(stack[stack.length - 1], name);
-      if (!node && parts.length) fail('ENOENT', syscall, path);
-      if (!node) break;
+      [parent, name, dirOnly] = [stack[stack.length - 1], part, false];
+      node = await this.child(parent, name);
+      if (!node && parts.some((p) => p !== '')) fail('ENOENT', syscall, path);
+      if (!node) {
+        dirOnly = parts.length > 0;
+        break;
+      }
       if (node.stats.isSymbolicLink() && (parts.length || followLast)) {
         if (++links > MAX_LINKS) fail('ELOOP', syscall, path);
         const target = await this.target(node);
@@ -200,7 +208,7 @@ export class OverlayFS implements FileSystem {
         stack.push(node);
       }
     }
-    return { parent: stack[stack.length - 1], name, node };
+    return { parent, name, node, dirOnly };
   }
 
   private async find(path: string, followLast: boolean, syscall: FsSyscall): Promise<Node> {
@@ -284,8 +292,10 @@ export class OverlayFS implements FileSystem {
       pread: (offset, size) => this.pread(entry, offset, size),
       fstat: () => this.stats(entry),
       fsync: async () => {},
-      pwrite: async (offset, data) => (await file()).pwrite(offset, data),
-      truncate: async (size) => (await file(size > 0)).truncate(size),
+      pwrite: (offset, data) =>
+        this.exclusive(async () => (offset < 0 ? fail('EINVAL', 'open') : (await file()).pwrite(offset, data))),
+      truncate: (size) =>
+        this.exclusive(async () => (!(size >= 0) ? fail('EINVAL', 'open') : (await file(size > 0)).truncate(size))),
     };
   }
 
@@ -318,7 +328,7 @@ export class OverlayFS implements FileSystem {
 
   private async writeLink(ino: number, target: string): Promise<void> {
     await this.db.prepare('INSERT INTO fs_symlink (ino, target) VALUES (?, ?)').run(ino, target);
-    await this.db.prepare('UPDATE fs_inode SET size = ? WHERE ino = ?').run(target.length, ino);
+    await this.db.prepare('UPDATE fs_inode SET size = ? WHERE ino = ?').run(this.B.byteLength(target), ino);
   }
 
   private async add(parent: Node, name: string, mode: number): Promise<number> {
@@ -332,6 +342,7 @@ export class OverlayFS implements FileSystem {
     const { parent, name, node } = await this.walk(path, false, syscall);
     const found = node ?? fail('ENOENT', syscall, path);
     if (found.path === '/') fail('EPERM', syscall, path);
+    if (!name) fail('EINVAL', syscall, path);
     return { parent, name, node: found };
   }
 
@@ -349,6 +360,17 @@ export class OverlayFS implements FileSystem {
     return node?.entry === entry ? this.copyUp(node, withContent) : fail('ENOENT', 'open', entry.lowerPath);
   }
 
+  /** Runs mutations one at a time, so concurrent first copy-ups and writes cannot interleave. */
+  private exclusive<T>(op: () => Promise<T>): Promise<T> {
+    const run = this.tail.then(op);
+    this.tail = run.catch(() => {});
+    return run;
+  }
+
+  private locked<A extends unknown[]>(op: (...args: A) => Promise<void>) {
+    return (...args: A) => this.exclusive(() => op.apply(this, args));
+  }
+
   private async subtree(node: Node): Promise<Node[]> {
     const nodes = [node];
     if (isDir(node.stats)) {
@@ -357,72 +379,74 @@ export class OverlayFS implements FileSystem {
     return nodes;
   }
 
-  async writeFile(path: string, data: string | Buffer, options?: BufferEncoding | { encoding?: BufferEncoding }) {
+  private async doWriteFile(path: string, data: string | Buffer, options?: BufferEncoding | { encoding?: BufferEncoding }) {
     const content = typeof data === 'string' ? this.B.from(data, typeof options === 'string' ? options : options?.encoding) : data;
     const dirs = path.split('/').filter(Boolean).slice(0, -1);
     for (let i = 1; i <= dirs.length; i++) {
       const dir = '/' + dirs.slice(0, i).join('/');
-      if (!(await this.walk(dir, true, 'open')).node) await this.mkdir(dir);
+      if (!(await this.walk(dir, true, 'open')).node) await this.doMkdir(dir);
     }
-    const { parent, name, node } = await this.walk(path, true, 'open');
-    if (node && isDir(node.stats)) fail('EISDIR', 'open', path);
+    const { parent, name, node, dirOnly } = await this.walk(path, true, 'open');
+    if (dirOnly || (node && isDir(node.stats))) fail('EISDIR', 'open', path);
     const ino = node ? await this.copyUp(node, false) : await this.add(parent, name, DEFAULT_FILE_MODE);
     const file = new AgentFSFile(this.db, this.B, ino, this.delta.getChunkSize());
     await file.truncate(0);
     await file.pwrite(0, content);
   }
 
-  async mkdir(path: string): Promise<void> {
+  private async doMkdir(path: string): Promise<void> {
     const { parent, name, node } = await this.walk(path, false, 'mkdir');
     if (node) fail('EEXIST', 'mkdir', path);
     await this.add(parent, name, DEFAULT_DIR_MODE);
   }
 
-  async symlink(target: string, path: string): Promise<void> {
-    const { parent, name, node } = await this.walk(path, false, 'open');
+  private async doSymlink(target: string, path: string): Promise<void> {
+    const { parent, name, node, dirOnly } = await this.walk(path, false, 'open');
     if (node) fail('EEXIST', 'open', path);
+    if (dirOnly) fail('ENOENT', 'open', path);
     await this.writeLink(await this.add(parent, name, S_IFLNK | 0o777), target);
   }
 
-  async unlink(path: string): Promise<void> {
+  private async doUnlink(path: string): Promise<void> {
     const found = await this.locate(path, 'unlink');
     if (isDir(found.node.stats)) fail('EISDIR', 'unlink', path);
     await this.remove(found);
   }
 
-  async rmdir(path: string): Promise<void> {
+  private async doRmdir(path: string): Promise<void> {
     const found = await this.locate(path, 'rmdir');
     if (!isDir(found.node.stats)) fail('ENOTDIR', 'rmdir', path);
     if ((await this.names(found.node)).length) fail('ENOTEMPTY', 'rmdir', path);
     await this.remove(found);
   }
 
-  async rm(path: string, options?: { force?: boolean; recursive?: boolean }): Promise<void> {
+  private async doRm(path: string, options?: { force?: boolean; recursive?: boolean }): Promise<void> {
     const walked = await this.walk(path, false, 'rm').catch((e) => (options?.force && e.code === 'ENOENT' ? null : Promise.reject(e)));
     const node = walked?.node;
     if (!node) return options?.force ? undefined : fail('ENOENT', 'rm', path);
     if (node.path === '/') fail('EPERM', 'rm', path);
-    if (!isDir(node.stats)) return this.unlink(path);
+    if (!isDir(node.stats)) return this.doUnlink(path);
     if (!options?.recursive) fail('EISDIR', 'rm', path);
-    for (const name of await this.names(node)) await this.rm(join(node.path, name), { recursive: true });
-    await this.rmdir(node.path);
+    for (const name of await this.names(node)) await this.doRm(join(node.path, name), { recursive: true });
+    await this.doRmdir(node.path);
   }
 
-  async chmod(path: string, mode: number): Promise<void> {
+  private async doChmod(path: string, mode: number): Promise<void> {
     const ino = await this.copyUp(await this.find(path, true, 'chmod'));
     await this.db.prepare('UPDATE fs_inode SET mode = (mode & ?) | ?, ctime = ? WHERE ino = ?').run(S_IFMT, mode & 0o7777, now(), ino);
   }
 
-  async link(existingPath: string, newPath: string): Promise<void> {
+  private async doLink(existingPath: string, newPath: string): Promise<void> {
     const { node } = await this.locate(existingPath, 'link');
     if (isDir(node.stats)) fail('EPERM', 'link', existingPath);
     const ino = node.entry.deltaIno ?? fail('EXDEV', 'link', existingPath);
-    const { parent, name, node: existing } = await this.walk(newPath, false, 'link');
+    const { parent, name, node: existing, dirOnly } = await this.walk(newPath, false, 'link');
     if (existing) fail('EEXIST', 'link', newPath);
+    if (dirOnly) fail('ENOENT', 'link', newPath);
     await this.delta.createDentry(await this.copyUp(parent), name, ino);
   }
 
-  async rename(oldPath: string, newPath: string): Promise<void> {
+  private async doRename(oldPath: string, newPath: string): Promise<void> {
     const src = await this.locate(oldPath, 'rename');
     const dst = await this.walk(newPath, false, 'rename');
     const dstPath = dst.node?.path ?? join(dst.parent.path, dst.name);
@@ -430,10 +454,11 @@ export class OverlayFS implements FileSystem {
     if (src.node.path === dstPath || (srcDelta !== undefined && srcDelta === dst.node?.entry.deltaIno)) return;
     const srcIsDir = isDir(src.node.stats);
     if (srcIsDir && dstPath.startsWith(src.node.path + '/')) fail('EINVAL', 'rename', newPath);
+    if (!dst.name) fail('EINVAL', 'rename', newPath);
     if (dst.node) {
       if (isDir(dst.node.stats) !== srcIsDir) fail(srcIsDir ? 'ENOTDIR' : 'EISDIR', 'rename', newPath);
       if (srcIsDir && (await this.names(dst.node)).length) fail('ENOTEMPTY', 'rename', newPath);
-    }
+    } else if (dst.dirOnly && !srcIsDir) fail('ENOTDIR', 'rename', newPath);
     const tree = await this.subtree(src.node);
     for (const n of tree) if (n.lower && n.entry.deltaIno === undefined && !copyable(n.lower.mode)) fail('ENOTSUP', 'rename', n.path);
     for (const n of tree) await this.copyUp(n);
@@ -446,10 +471,21 @@ export class OverlayFS implements FileSystem {
     await this.hide(dst.node);
   }
 
-  async copyFile(src: string, dest: string): Promise<void> {
-    await this.writeFile(dest, await this.readFile(src));
-    await this.chmod(dest, (await this.stat(src)).mode);
+  private async doCopyFile(src: string, dest: string): Promise<void> {
+    await this.doWriteFile(dest, await this.readFile(src));
+    await this.doChmod(dest, (await this.stat(src)).mode);
   }
+
+  writeFile = this.locked(this.doWriteFile);
+  mkdir = this.locked(this.doMkdir);
+  symlink = this.locked(this.doSymlink);
+  unlink = this.locked(this.doUnlink);
+  rmdir = this.locked(this.doRmdir);
+  rm = this.locked(this.doRm);
+  chmod = this.locked(this.doChmod);
+  link = this.locked(this.doLink);
+  rename = this.locked(this.doRename);
+  copyFile = this.locked(this.doCopyFile);
 
   /**
    * Compares the merged tree with the base tree without reading the whole base: it walks the

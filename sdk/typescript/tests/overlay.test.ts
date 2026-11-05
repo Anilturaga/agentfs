@@ -281,6 +281,63 @@ describe('OverlayFS read path', () => {
       expect((await overlay.stat('/e')).mode & 0o7777).toBe(0o700);
     });
 
+    it('resolves dentries by name when a path ends in a slash, and keeps them valid after a reopen', async () => {
+      overlay = await openMerged(db, base);
+      await overlay.rename('/d', '/e/');
+      await overlay.mkdir('/n/');
+      await overlay.rmdir('/n/');
+      await overlay.mkdir('/k');
+      await overlay.rename('/k/', '/k2');
+      expect(await code(overlay.rmdir('/e/.'))).toBe('EINVAL');
+      expect(await code(overlay.rename('/f', '/zz/'))).toBe('ENOTDIR');
+      expect(await code(overlay.symlink('t', '/s/'))).toBe('ENOENT');
+      expect(await code(overlay.writeFile('/w/', 'x'))).toBe('EISDIR');
+      await overlay.close();
+      overlay = await openMerged(db);
+      expect(await overlay.readdir('/')).toEqual(['e', 'f', 'k2', 'l', 'p']);
+      expect(await overlay.readFile('/e/sub/y', 'utf8')).toBe('y');
+      await overlay.close();
+      overlay = undefined;
+      const raw = new Database(db);
+      await raw.connect();
+      const dangling = `SELECT count(*) AS n FROM fs_dentry d LEFT JOIN fs_inode i ON i.ino = d.ino
+        LEFT JOIN fs_inode p ON p.ino = d.parent_ino WHERE i.ino IS NULL OR p.ino IS NULL`;
+      expect(await raw.prepare(dangling).get()).toEqual({ n: 0 });
+      await raw.close();
+    });
+
+    it('serializes concurrent first writes and creates under one lower entry', async () => {
+      overlay = await openMerged(db, base);
+      const [a, b] = [await overlay.open('/f'), await overlay.open('/f')];
+      await Promise.all([a.pwrite(0, Buffer.from('A')), b.pwrite(1, Buffer.from('B'))]);
+      expect(await overlay.readFile('/f', 'utf8')).toBe('ABse');
+      await Promise.all([overlay.writeFile('/d/a', 'A'), overlay.writeFile('/d/b', 'B')]);
+      expect([await overlay.readFile('/d/a', 'utf8'), await overlay.readFile('/d/b', 'utf8')]).toEqual(['A', 'B']);
+    });
+
+    it('stores the byte length of a non-ASCII symlink target', async () => {
+      symlinkSync('é', join(base, 'u'));
+      overlay = await openMerged(db, base);
+      await overlay.rename('/u', '/moved');
+      await overlay.symlink('é', '/made');
+      const sizes = async (o: OverlayFS) => [(await o.lstat('/moved')).size, (await o.lstat('/made')).size];
+      expect(await sizes(overlay)).toEqual([2, 2]);
+      await overlay.close();
+      overlay = await openMerged(db);
+      expect(await sizes(overlay)).toEqual([2, 2]);
+    });
+
+    it('rejects negative sizes and offsets before copying up', async () => {
+      overlay = await openMerged(db, base);
+      const h = await overlay.open('/f');
+      expect(await code(h.truncate(-1))).toBe('EINVAL');
+      expect(await code(h.pwrite(-1, Buffer.from('x')))).toBe('EINVAL');
+      expect(await text(overlay)).toBe('');
+      await h.pwrite(0, Buffer.from('B'));
+      expect(await code(h.truncate(-1))).toBe('EINVAL');
+      expect([await overlay.readFile('/f', 'utf8'), (await overlay.stat('/f')).size]).toEqual(['Base', 4]);
+    });
+
     it('refuses to copy up a lower FIFO and changes nothing', async () => {
       execFileSync('mkfifo', [join(base, 'd', 'fifo')]);
       overlay = await openMerged(db, base);
