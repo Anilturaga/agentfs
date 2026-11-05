@@ -30,7 +30,6 @@ pub async fn open_agentfs(options: AgentFSOptions) -> Result<AgentFS, SdkError> 
     AgentFS::open(with_env_token(options)).await
 }
 
-/// The database named by an agent ID, a path, or the ID of an `agentfs run` session.
 pub fn resolve_db(
     id_or_path: &str,
     encryption: Option<&(String, String)>,
@@ -52,7 +51,6 @@ pub fn resolve_db(
     Ok(options)
 }
 
-/// A database opened as an overlay when it is one, else as a plain filesystem.
 pub enum Opened {
     Merged(MergedFS),
     Plain(AgentFS),
@@ -88,7 +86,6 @@ impl Opened {
     }
 }
 
-/// Open the database over `base` or its recorded base; a non-overlay opens as plain.
 pub async fn open_fs(options: AgentFSOptions, base: Option<Base>) -> Result<Opened, SdkError> {
     let exists = options.db_path().is_ok_and(|db| Path::new(&db).exists());
     if base.is_none() && !exists {
@@ -105,8 +102,7 @@ pub async fn open_fs(options: AgentFSOptions, base: Option<Base>) -> Result<Open
     }
 }
 
-/// Open the overlay of an `agentfs run` session, creating it on the first run. A later run
-/// over another directory fails with `ESTALE`.
+/// Open the overlay of an `agentfs run` session; another directory fails with `ESTALE`.
 pub async fn open_session(options: AgentFSOptions, base: Base) -> Result<MergedFS, SdkError> {
     if !options.db_path().is_ok_and(|db| Path::new(&db).exists()) {
         match create_overlay(options.clone(), &base).await {

@@ -324,7 +324,6 @@ pub trait FileSystem: Send + Sync {
 pub struct PathFS(pub Arc<dyn FileSystem>);
 
 impl PathFS {
-    /// The entry at `path`. A symlink at the last name is followed only with `follow_last`.
     pub async fn resolve(&self, path: &str, follow_last: bool) -> Result<Stats> {
         let names = |p: &str| -> Vec<String> {
             let parts = p.rsplit('/').filter(|c| !c.is_empty() && *c != ".");
@@ -412,7 +411,6 @@ impl PathFS {
         self.0.rename(dir, name, new_dir, new_name).await
     }
 
-    /// Where a file written to the missing `path` is created, through dangling symlinks.
     async fn creation_site(&self, path: &str) -> Result<(i64, String)> {
         let mut path = path.to_string();
         for _ in 0..=40 {

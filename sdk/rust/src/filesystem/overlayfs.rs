@@ -38,7 +38,6 @@ pub(crate) fn host_identity(path: &str) -> Result<String> {
     Ok(format!("host:{}:{}", meta.dev(), meta.ino()))
 }
 
-/// A path whose entry differs between the base and the merged view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
     /// `A` added, `M` modified, `D` deleted

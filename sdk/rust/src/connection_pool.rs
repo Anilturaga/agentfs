@@ -77,13 +77,14 @@ impl ConnectionPool {
         let _ = self.inner.keep.set(held);
     }
 
-    pub(crate) fn reserve(path: &str) -> Result<Option<Arc<dyn Any + Send + Sync>>> {
+    pub(crate) fn reserve(path: &str) -> Result<(Option<Arc<dyn Any + Send + Sync>>, bool)> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if path != ":memory:" {
             let held = crate::overlay::Reservation::acquire_or_create(path)?;
-            return Ok(Some(Arc::new(held)));
+            let created = held.created;
+            return Ok((Some(Arc::new(held)), created));
         }
-        Ok(None)
+        Ok((None, false))
     }
 
     pub(crate) async fn open_held(
@@ -97,7 +98,7 @@ impl ConnectionPool {
     }
 
     pub(crate) async fn open_local(path: &str, enc: Option<&EncryptionConfig>) -> Result<Self> {
-        Self::open_held(path, enc, Self::reserve(path)?).await
+        Self::open_held(path, enc, Self::reserve(path)?.0).await
     }
 
     /// Get a connection from the pool.
@@ -162,25 +163,34 @@ impl ConnectionPool {
 
 impl Drop for ConnectionPoolInner {
     /// A hard link of a database file has sidecars of its own, so a reserved database has its
-    /// log checkpointed into the file before the reservation ends.
+    /// log checkpointed into the file before the reservation ends. The idle connections close
+    /// first, rolling back any open transaction. The log is not truncated: a leaked one blocks it.
     fn drop(&mut self) {
         let (DatabaseType::Local(db), Some(_)) = (&self.db, self.keep.get()) else {
             return;
         };
-        let db = db.clone();
-        let _ = std::thread::spawn(move || {
+        let (db, idle) = (db.clone(), std::mem::take(self.pool.get_mut()));
+        let done = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread().build().ok()?;
             rt.block_on(async {
+                for conn in idle
+                    .iter()
+                    .filter(|c| matches!(c.is_autocommit(), Ok(false)))
+                {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                }
+                drop(idle);
                 let conn = db.connect().ok()?;
-                let mut rows = conn
-                    .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
-                    .await
-                    .ok()?;
-                while rows.next().await.ok()?.is_some() {}
-                Some(())
+                let sql = "PRAGMA wal_checkpoint(FULL)";
+                let row = conn.query(sql, ()).await.ok()?.next().await.ok()??;
+                let (busy, log, done) = (row.get_value(0), row.get_value(1), row.get_value(2));
+                Some(busy.ok()? == turso::Value::Integer(0) && log.ok()? == done.ok()?)
             })
         })
         .join();
+        if !matches!(done, Ok(Some(true))) {
+            tracing::warn!("a database was closed without checkpointing its log");
+        }
     }
 }
 

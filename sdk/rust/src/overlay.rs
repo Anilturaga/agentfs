@@ -22,7 +22,6 @@ use std::{
 const SIDECARS: [&str; 6] = ["-wal", "-shm", "-log", "-wal-revert", "-info", "-changes"];
 
 pub struct Base {
-    /// The adapter that reads the lower layer. It may be another view of the same directory.
     pub fs: Arc<dyn FileSystem>,
     pub path: String,
     pub identity: String,
@@ -74,7 +73,6 @@ type Key = (u64, u64);
 #[derive(Default)]
 struct Entry {
     info: Option<OverlayInfo>,
-    /// Descriptors that must outlive the entry's holder, see `Reservation::acquire`
     parked: Vec<File>,
 }
 
@@ -119,9 +117,9 @@ type Hook = Box<dyn Fn()>;
 
 #[cfg(test)]
 thread_local! {
-    /// Runs between opening the file and locking it (0), before delete unlinks it (1), and between
-    /// creating a file and reserving it (2).
-    static HOOKS: std::cell::RefCell<[Option<Hook>; 3]> = Default::default();
+    /// Runs between opening the file and locking it (0), before delete unlinks it (1), between
+    /// creating a file and reserving it (2), and before creating it (3).
+    static HOOKS: std::cell::RefCell<[Option<Hook>; 4]> = Default::default();
 }
 
 #[cfg(test)]
@@ -131,6 +129,7 @@ fn hook(stage: usize) {
 
 pub(crate) struct Reservation {
     key: Key,
+    pub(crate) created: bool,
     file: Option<File>,
     db: String,
 }
@@ -139,6 +138,8 @@ impl Reservation {
     /// Like `acquire`, after creating the file if it is absent. The descriptor of a new file
     /// becomes the reservation's, or is parked if another opener wins.
     pub(crate) fn acquire_or_create(path: &str) -> Result<Self> {
+        #[cfg(test)]
+        hook(3);
         let created = OpenOptions::new()
             .read(true)
             .write(true)
@@ -172,6 +173,7 @@ impl Reservation {
         }
         let mut held = Self {
             key,
+            created: created.is_some(),
             file: None,
             db,
         };
@@ -212,8 +214,7 @@ impl Reservation {
 }
 
 impl Drop for Reservation {
-    /// Holds the registry through the closes, so no one reserves the file while a descriptor
-    /// of it is still open.
+    /// Holds the registry through the closes, so no one reserves a still-open file.
     fn drop(&mut self) {
         let mut registry = registry();
         if let Some(entry) = registry.get_mut(&self.key) {
@@ -525,6 +526,22 @@ mod tests {
             .status();
         assert_eq!(probe.unwrap().code(), Some(0));
         assert!(winner.borrow().is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_remote_open_keeps_a_file_another_opener_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("new.db");
+        let path = db.clone();
+        set_hook(3, move || std::fs::write(&path, b"populated").unwrap());
+        let remote = SyncOptions {
+            remote_url: Some("http://127.0.0.1:9".to_string()),
+            ..Default::default()
+        };
+        let opened = AgentFS::open(opts(&db).with_sync(remote)).await;
+        HOOKS.with(|hooks| hooks.borrow_mut()[3] = None);
+        assert!(opened.is_err());
+        assert_eq!(std::fs::read(&db).unwrap(), b"populated");
     }
 
     #[tokio::test]

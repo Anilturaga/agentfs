@@ -62,8 +62,9 @@ fn wait_for(child: &mut Child, line: &str) {
     let mut out = BufReader::new(child.stdout.as_mut().unwrap());
     let mut text = String::new();
     while text.trim() != line {
-        text.clear();
-        assert!(out.read_line(&mut text).unwrap() > 0, "helper ended early");
+        let last = std::mem::take(&mut text);
+        let ended = out.read_line(&mut text).unwrap() == 0;
+        assert!(!ended, "helper ended early after {last:?}, wanted {line:?}");
     }
 }
 
@@ -146,6 +147,15 @@ fn helper() {
                 "{}",
                 data.map_or("missing".to_string(), |d| String::from_utf8(d).unwrap())
             );
+        }
+        "read_kv" => {
+            let options = match base.as_str() {
+                "" => opts(Path::new(&db)),
+                key => opts(Path::new(&db)).with_encryption_key(key, "aegis256"),
+            };
+            let merged = rt.block_on(open_merged(options, None)).unwrap();
+            let value = rt.block_on(merged.kv.get::<String>("k")).unwrap();
+            println!("{}", value.unwrap_or_else(|| "missing".to_string()));
         }
         "open_loop" => loop {
             let opened = rt.block_on(open_merged(
@@ -429,6 +439,39 @@ async fn hard_link_alias_sees_the_data_after_the_handles_drop() {
     let mut child = spawn("read_added", &alias, &alias);
     wait_for(&mut child, "x");
     finish(child);
+}
+
+#[tokio::test]
+async fn pooled_transactions_do_not_block_the_checkpoint() {
+    let key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    for (begin, key) in [
+        ("BEGIN IMMEDIATE", None),
+        ("BEGIN", None),
+        ("BEGIN IMMEDIATE", Some(key)),
+    ] {
+        let keyed =
+            |o: AgentFSOptions| key.map_or(o.clone(), |k| o.with_encryption_key(k, "aegis256"));
+        let dir = tempfile::tempdir().unwrap();
+        let (db, base) = (dir.path().join("o.db"), make_base(dir.path(), "base"));
+        create_overlay(keyed(opts(&db)), &base).await.unwrap();
+        let alias = dir.path().join("alias.db");
+        std::fs::hard_link(&db, &alias).unwrap();
+        let merged = open_merged(keyed(opts(&db)), None).await.unwrap();
+        merged.kv.set("k", &"after").await.unwrap();
+        let conn = merged.fs.delta().get_connection().await.unwrap();
+        conn.execute(begin, ()).await.unwrap();
+        let mut rows = conn
+            .query("SELECT count(*) FROM kv_store", ())
+            .await
+            .unwrap();
+        while rows.next().await.unwrap().is_some() {}
+        drop((rows, conn, merged));
+
+        // the helper reads its key from the base argument, when it is not empty
+        let mut child = spawn("read_kv", &alias, Path::new(key.unwrap_or("")));
+        wait_for(&mut child, "after");
+        finish(child);
+    }
 }
 
 #[tokio::test]
