@@ -26,6 +26,15 @@ const OVERLAY_VERSION: &str = "1";
 const WHITEOUT_TABLE: &str = "fs_whiteout (path TEXT PRIMARY KEY, created_at INTEGER NOT NULL)";
 const ORIGIN_TABLE: &str = "fs_origin (delta_ino INTEGER PRIMARY KEY, lower_path TEXT)";
 
+fn errno(code: i32) -> Error {
+    std::io::Error::from_raw_os_error(code).into()
+}
+
+/// FIFOs, devices and sockets: a lower one is never opened or copied up.
+fn is_special(stats: &Stats) -> bool {
+    !(stats.is_file() || stats.is_directory() || stats.is_symlink())
+}
+
 /// Which layer an inode belongs to
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Layer {
@@ -603,12 +612,12 @@ impl OverlayFS {
 
             // Not in delta, check base (using the base inode, not delta inode)
             let base_stats = self.base.lookup(current_base_ino, component).await?;
-            let (dir_uid, dir_gid, origin_base_ino) = if let Some(s) = &base_stats {
+            let (dir_mode, dir_uid, dir_gid, origin_base_ino) = if let Some(s) = &base_stats {
                 let base_ino = s.ino;
                 current_base_ino = base_ino;
-                (s.uid, s.gid, Some(base_ino))
+                (s.mode & 0o7777, s.uid, s.gid, Some(base_ino))
             } else {
-                (uid, gid, None)
+                (0o755, uid, gid, None)
             };
 
             // Create directory in delta
@@ -616,7 +625,7 @@ impl OverlayFS {
                 &self.delta,
                 current_delta_ino,
                 component,
-                0o755,
+                dir_mode,
                 dir_uid,
                 dir_gid,
             )
@@ -673,6 +682,9 @@ impl OverlayFS {
             .getattr(base_ino)
             .await?
             .ok_or(FsError::NotFound)?;
+        if is_special(&base_stats) {
+            return Err(errno(libc::ENOTSUP));
+        }
 
         // Ensure parent directories exist
         self.ensure_parent_dirs(path, base_stats.uid, base_stats.gid)
@@ -915,30 +927,6 @@ impl FileSystem for OverlayFS {
 
         let mut entries_map: HashMap<String, DirEntry> = HashMap::new();
 
-        // Get base entries first (so delta can override)
-        if let Some(base_ino) = self.base_dir_ino(&info).await? {
-            if let Some(base_entries) = self.base.readdir_plus(base_ino).await? {
-                for mut entry in base_entries {
-                    let entry_path = if info.path == "/" {
-                        format!("/{}", entry.name)
-                    } else {
-                        format!("{}/{}", info.path, entry.name)
-                    };
-
-                    if !self.is_whiteout(&entry_path) {
-                        let overlay_ino = self.get_or_create_overlay_ino(
-                            Layer::Base,
-                            entry.stats.ino,
-                            &entry_path,
-                        );
-                        entry.stats.ino = overlay_ino;
-                        entries_map.insert(entry.name.clone(), entry);
-                    }
-                }
-            }
-        }
-
-        // Get delta entries (override base)
         if info.layer == Layer::Delta {
             if let Some(delta_entries) = self.delta.readdir_plus(info.underlying_ino).await? {
                 for mut entry in delta_entries {
@@ -949,6 +937,29 @@ impl FileSystem for OverlayFS {
                     };
                     entry.stats.ino = self.delta_overlay_ino(entry.stats.ino, &entry_path);
                     entries_map.insert(entry.name.clone(), entry);
+                }
+            }
+        }
+
+        // Base entries that no delta entry shadows
+        if let Some(base_ino) = self.base_dir_ino(&info).await? {
+            if let Some(base_entries) = self.base.readdir_plus(base_ino).await? {
+                for mut entry in base_entries {
+                    let entry_path = if info.path == "/" {
+                        format!("/{}", entry.name)
+                    } else {
+                        format!("{}/{}", info.path, entry.name)
+                    };
+
+                    if !entries_map.contains_key(&entry.name) && !self.is_whiteout(&entry_path) {
+                        let overlay_ino = self.get_or_create_overlay_ino(
+                            Layer::Base,
+                            entry.stats.ino,
+                            &entry_path,
+                        );
+                        entry.stats.ino = overlay_ino;
+                        entries_map.insert(entry.name.clone(), entry);
+                    }
                 }
             }
         }
@@ -1021,11 +1032,17 @@ impl FileSystem for OverlayFS {
 
         match info.layer {
             Layer::Delta => FileSystem::open(&self.delta, info.underlying_ino, flags).await,
-            Layer::Base => Ok(Arc::new(LowerHandle {
-                fs: self.clone(),
-                ino,
-                base_file: self.base.open(info.underlying_ino, libc::O_RDONLY).await?,
-            })),
+            Layer::Base => {
+                let stats = self.base.getattr(info.underlying_ino).await?;
+                if stats.is_some_and(|s| is_special(&s)) {
+                    return Err(errno(libc::ENOTSUP));
+                }
+                Ok(Arc::new(LowerHandle {
+                    fs: self.clone(),
+                    ino,
+                    base_file: self.base.open(info.underlying_ino, libc::O_RDONLY).await?,
+                }))
+            }
         }
     }
 
@@ -1250,12 +1267,10 @@ impl FileSystem for OverlayFS {
             .ok_or(FsError::NotFound)?;
         let new_path = self.build_path(newparent_ino, newname)?;
 
-        // Ensure file is in delta (copy up if needed)
-        let delta_ino = if info.layer == Layer::Delta {
-            info.underlying_ino
-        } else {
-            self.copy_up(&info.path, info.underlying_ino).await?
-        };
+        if info.layer == Layer::Base {
+            return Err(errno(libc::EXDEV));
+        }
+        let delta_ino = info.underlying_ino;
 
         self.ensure_parent_dirs(&new_path, 0, 0).await?;
 
@@ -1356,11 +1371,8 @@ impl FileSystem for OverlayFS {
         if let Some(e) = scan_error {
             return Err(e);
         }
-        if lower
-            .iter()
-            .any(|(_, s)| !(s.is_file() || s.is_directory() || s.is_symlink()))
-        {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into());
+        if lower.iter().any(|(_, s)| is_special(s)) {
+            return Err(errno(libc::ENOTSUP));
         }
         // Lower hard links share one overlay inode, so copy up by path: the entry
         // that owns the inode mapping follows into the delta, the others copy alone.
@@ -2744,26 +2756,27 @@ mod tests {
         Ok(())
     }
 
-    /// Hard-link copy-up in session 1, then unlink source in session 2.
+    /// Hard link of a delta file in session 1, then unlink source in session 2.
     /// The link target must survive even though the parent has a stale
     /// origin mapping.
     #[tokio::test]
     async fn test_overlay_link_copy_up_then_unlink_after_remount() -> Result<()> {
         let base_dir = tempdir()?;
         std::fs::create_dir(base_dir.path().join("dir"))?;
-        std::fs::write(base_dir.path().join("dir/src.txt"), b"link source")?;
 
         let delta_dir = tempdir()?;
         let db_path = delta_dir.path().join("delta.db");
 
-        // Session 1: hard-link triggers copy_up of src.txt
+        // Session 1: creating src.txt copies up its parent; then link it
         let base = Arc::new(HostFS::new(base_dir.path())?);
         let delta = AgentFS::new(db_path.to_str().unwrap()).await?;
         let overlay = OverlayFS::new(base, delta);
         overlay.init(base_dir.path().to_str().unwrap()).await?;
 
         let dir_stats = overlay.lookup(ROOT_INO, "dir").await?.unwrap();
-        let src_stats = overlay.lookup(dir_stats.ino, "src.txt").await?.unwrap();
+        let (src_stats, _) = overlay
+            .create_file(dir_stats.ino, "src.txt", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
         overlay
             .link(src_stats.ino, dir_stats.ino, "dst.txt")
             .await?;
