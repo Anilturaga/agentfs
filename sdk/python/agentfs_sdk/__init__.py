@@ -18,7 +18,10 @@ from .overlay import (
     OverlayFS,
     OverlayInfo,
     create_overlay,
+    delete_overlay,
+    list_overlays,
     open_merged,
+    rebind_overlay,
 )
 from .toolcalls import ToolCall, ToolCalls, ToolCallStats
 
@@ -50,5 +53,8 @@ __all__ = [
     "OverlayFS",
     "OverlayInfo",
     "create_overlay",
+    "delete_overlay",
+    "list_overlays",
     "open_merged",
+    "rebind_overlay",
 ]
