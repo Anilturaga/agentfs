@@ -378,7 +378,9 @@ To read `length` bytes starting at byte offset `offset`:
    WHERE ino = ? AND chunk_index >= ? AND chunk_index <= ?
    ORDER BY chunk_index ASC
    ```
-5. Get `size` from `fs_inode`. Place the fetched chunks as in Reading a File step 3. Return the bytes from offset `offset` through offset `min(offset + length, size) - 1`. If `offset >= size`, return no bytes
+5. Get `size` from `fs_inode`. If `offset >= size`, return no bytes
+6. Allocate `n = min(length, size - offset)` zero bytes
+7. Byte `j` of a fetched chunk is at file offset `p = chunk_index * chunk_size + j`. Copy each such byte whose `p` is from `offset` through `offset + n - 1` to buffer position `p - offset`. Return the buffer
 
 #### Listing a Directory
 
