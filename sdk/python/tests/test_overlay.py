@@ -21,7 +21,10 @@ from agentfs_sdk import (
     Filesystem,
     HostAdapter,
     create_overlay,
+    delete_overlay,
+    list_overlays,
     open_merged,
+    rebind_overlay,
 )
 
 REPO = Path(__file__).resolve().parents[3]
@@ -95,6 +98,21 @@ async def code(coro) -> str:
     with pytest.raises(ErrnoException) as excinfo:
         await coro
     return excinfo.value.code
+
+
+OPEN_CODE = """
+    async def main():
+        try:
+            await open_merged(sys.argv[1], sys.argv[2])
+        except OSError as e:
+            print(e.code)
+    asyncio.run(main())
+"""
+
+
+def child_open_code(db, base) -> str:
+    """The error code of `open_merged` in another process; empty if it opened."""
+    return child(OPEN_CODE, str(db), str(base)).communicate(timeout=30)[0].strip()
 
 
 def child_opens(db, base) -> bool:
@@ -522,3 +540,113 @@ async def test_handle_after_ancestor_became_symlink_loop_is_enoent(overlay, base
         await fs.rm("/d")
         await fs.symlink("f", "/d")
         assert await code(handle.pwrite(0, b"z")) == "ENOENT"
+
+
+SIDECARS = ("-wal", "-shm", "-log", "-wal-revert", "-info", "-changes")
+
+
+async def plain_db(path):
+    await (await AgentFS.open(AgentFSOptions(path=str(path)))).close()
+    gc.collect()
+
+
+async def test_management_errors(tmp_path, base, overlay):
+    other = tmp_path / "other"
+    other.mkdir()
+    missing, plain, v2 = tmp_path / "missing.db", tmp_path / "plain.db", tmp_path / "v2.db"
+    await plain_db(plain)
+    await create_overlay(v2, base)
+    await raw(
+        v2, lambda c: c.execute("UPDATE fs_overlay_config SET value = '2' WHERE key = 'version'")
+    )
+
+    for db in (missing, plain, v2):
+        want = {missing: "ENOENT", plain: "EINVAL", v2: "ENOTSUP"}[db]
+        assert await code(rebind_overlay(db, base)) == want
+    assert await code(delete_overlay(missing)) == "ENOENT"
+    assert await code(delete_overlay(plain)) == "EINVAL"
+    assert not missing.exists() and plain.exists()
+
+    holder = child(HOLD, str(overlay), str(base), stdin=subprocess.PIPE)
+    try:
+        assert holder.stdout.readline() == "ready\n"
+        assert await code(delete_overlay(overlay)) == "EBUSY"
+        assert await code(rebind_overlay(overlay, other)) == "EBUSY"
+    finally:
+        holder.communicate("\n", timeout=30)
+    assert await code(open_merged(overlay, other)) == "ESTALE"
+
+    await delete_overlay(overlay)
+    assert not overlay.exists()
+
+
+async def test_hard_linked_database_is_refused(tmp_path, base, overlay):
+    os.link(overlay, tmp_path / "alias")
+    before = sorted(p.name for p in tmp_path.iterdir()), overlay.read_bytes()
+    for attempt in (
+        open_merged(overlay, base),
+        delete_overlay(overlay),
+        rebind_overlay(overlay, base),
+    ):
+        assert await code(attempt) == "ENOTSUP"
+    assert await list_overlays(tmp_path) == []
+    assert (sorted(p.name for p in tmp_path.iterdir()), overlay.read_bytes()) == before
+
+
+async def test_list_overlays(tmp_path, base, overlay):
+    other = tmp_path / "other"
+    other.mkdir()
+    shutil.copyfile(LEGACY_RUST_DB, tmp_path / "legacy.db")
+    update = f"UPDATE fs_overlay_config SET value = '{base}' WHERE key = 'base_path'"
+    await raw(tmp_path / "legacy.db", lambda c: c.execute(update))
+    await plain_db(tmp_path / "plain.db")
+    (tmp_path / "garbage.db").write_text("not a database")
+    (tmp_path / "dir.db").mkdir()
+    (tmp_path / "notes.txt").write_text("x")
+
+    listed = await list_overlays(tmp_path)
+    assert [(i.path, i.version) for i in listed] == [
+        (str(tmp_path / "legacy.db"), 0),
+        (str(overlay), 1),
+    ]
+    assert listed[0].base_identity == "" and listed[1].base_path == str(base.resolve())
+    assert await list_overlays(tmp_path, base) == listed
+    assert await list_overlays(tmp_path, other) == []
+
+
+async def test_delete_holds_lock_until_removed(tmp_path, base, overlay, monkeypatch):
+    checked, remove = [], os.remove
+
+    def spy(path, *args, **kwargs):
+        first = not checked
+        if first or str(path) == str(overlay):
+            checked.append(child_open_code(overlay, base))
+        if first:
+            for suffix in SIDECARS:
+                Path(f"{overlay}{suffix}").touch()
+        remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", spy)
+    await delete_overlay(overlay)
+    monkeypatch.undo()
+    assert checked == ["EBUSY", "EBUSY"]
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("o.db")] == []
+    assert child_open_code(overlay, base) == "ENOENT"
+
+
+async def test_list_keeps_open_overlay_locked(tmp_path, base, overlay):
+    async with await open_merged(overlay, base) as fs:
+        assert [i.path for i in await list_overlays(tmp_path, base)] == [str(overlay)]
+        assert child_open_code(overlay, base) == "EBUSY"
+        await fs.write_file("/n", "x")
+        assert await fs.read_file("/n") == "x"
+
+
+async def test_management_releases_lock(tmp_path, base, overlay):
+    other = tmp_path / "other"
+    other.mkdir()
+    await list_overlays(tmp_path)
+    assert child_opens(overlay, base)
+    await rebind_overlay(overlay, other)
+    assert child_opens(overlay, other)
+    assert await code(open_merged(overlay, base)) == "ESTALE"
