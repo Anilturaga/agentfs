@@ -535,12 +535,12 @@ CREATE TABLE fs_whiteout (
 ```sql
 CREATE TABLE fs_origin (
   delta_ino INTEGER PRIMARY KEY,
-  lower_path TEXT NOT NULL
+  lower_path TEXT
 )
 ```
 
 - `delta_ino` - Delta inode that a copy-up created
-- `lower_path` - Path of the copied base entry at copy-up time. It always names an entry of this overlay's base layer, the only lower layer in v1.
+- `lower_path` - Path of the copied base entry at copy-up time, in this overlay's base layer (the only lower layer in v1). NULL means the path is unknown: the origin was migrated from a legacy database.
 - Origins record provenance only. Lookup, stat, readdir and diff MUST NOT read `fs_origin`.
 
 ### Lower Layer
@@ -553,9 +553,9 @@ An SDK reads the base through a read-only lower adapter. The adapter provides:
 - `readlink(path)` - symlink target
 - `read(path, offset, length)` - bytes of a regular file
 
-The **host adapter** serves a host directory. Its locator is the canonical absolute path of the directory. Its identity is `host:` followed by the decimal `st_ino` of that directory, for example `host:1234567`. Browser and Cloudflare targets inject their own adapter.
+The **host adapter** serves a host directory. Its locator is the canonical absolute path of the directory. Its identity is `host:<st_dev>:<st_ino>` of that directory in decimal, for example `host:2049:1234567`. A remount can change `st_dev` (for example after a container restart). The identity then changes and `openMerged` fails with `ESTALE`. Browser and Cloudflare targets inject their own adapter.
 
-The base MUST NOT change while an overlay over it is open. v1 does not detect changes inside the base.
+The base MUST NOT change while an overlay over it is open. The base MAY change while no overlay over it is open. v1 does not detect such changes: after reopen, lower-backed entries show the current base, and delta entries and whiteouts keep their meaning by path.
 
 ### Lookup Precedence
 
@@ -624,7 +624,7 @@ SDK path resolution walks the merged view one component at a time.
 - The open instance gives each merged entry an `ino`. The root has `ino` 1.
 - In one instance, an entry keeps its `ino` through `lookup`, `stat`, `lstat`, `readdir-plus`, `fstat`, copy-up and rename. Distinct entries have distinct values, except delta hard links of one delta inode, which share one. An instance never reuses an `ino`.
 - An entry starts at its first lookup. It ends when it is removed or replaced.
-- After close and reopen, `ino` values MAY differ. The type, permission bits, uid, gid, size, nlink and mtime of each entry MUST NOT change.
+- After close and reopen, `ino` values MAY differ. The type, permission bits, uid, gid, size, nlink and mtime of each delta-backed entry MUST NOT change. The same applies to a lower-backed entry whose base entry did not change.
 
 ### Writer Policy
 
@@ -650,7 +650,7 @@ SDK path resolution walks the merged view one component at a time.
 Migration runs in one transaction. A failed migration leaves the database unchanged.
 
 1. `fs_whiteout`: create it if absent. If it has a `parent_path` column (legacy Go), rebuild it as v1 and keep every row. Drop `idx_fs_whiteout_parent`.
-2. `fs_origin`: create it if absent. If it has a `base_ino` column, rebuild it as v1. Set `lower_path` to the delta path of `delta_ino` (from its dentry with the lowest `id`). Drop rows whose `delta_ino` has no dentry.
+2. `fs_origin`: create it if absent. If it has a `base_ino` column, rebuild it as v1: keep every row and set `lower_path` to NULL.
 3. `fs_overlay_config`: create it if absent. Write `base_path` and `base_identity` from the base that is being opened. Write `version` = `1` last.
 
 The AgentFS schema version (`0.4`) is independent of the overlay format version.
@@ -707,7 +707,9 @@ Every SDK exposes these operations in its own naming style. `base` is a host dir
 | Copy-up on first change, never on open | TypeScript and Python `open` has no flags; one rule fits every SDK. | Copy-up on a write-intent open |
 | Instance-scoped `ino` | Browser and Cloudflare adapters have no stable inode numbers. | A persisted `ino` map |
 | One opener, enforced by a lock | Turso already takes the lock; caches need no invalidation. | Concurrent readers with generation checks |
-| Host identity is `st_ino` of the base root | Detects a replaced base; `st_dev` changes across container restarts. | Content hash (slow); `st_dev` plus `st_ino` |
+| Host identity is `st_dev` and `st_ino` of the base root | `st_ino` repeats across filesystems (mount roots are often inode 1). A false match merges an unrelated tree; a false mismatch is loud and loses no data. | `st_ino` only (false matches); filesystem UUID (no portable API in Node); content hash (slow) |
+| Legacy origins migrate with `lower_path` NULL | A legacy row stores a process-local counter, and the current dentry path is wrong after a rename. | Derive the path from the current dentry; keep `base_ino` |
+| The base may change while no overlay is open | The path merge gives a defined result for any base state, and users edit project bases between sessions. | Base immutable for the overlay's lifetime (unenforceable; breaks that workflow) |
 | Hard link across layers fails with `EXDEV` | A copy-up would split the base link group; tools fall back on `EXDEV`. | Copy up, then link |
 | Lower special files fail with `ENOTSUP` | Copying a FIFO or device by content blocks or corrupts. | Copy-up as a new special file |
 | Diff is a set comparison of two trees | Independent of storage; no host probes; correct for symlinks. | Probe host paths with `exists()` |
@@ -762,11 +764,13 @@ Each case starts with a new overlay over this base. `write P "s"` creates P if i
 30. `link /f /f2` → `EXDEV`; `write /n "1"`; `link /n /n2`; `stat(/n).ino` = `stat(/n2).ino`.
 31. `chmod /p 0600` → `ENOTSUP`; `open /p` → `ENOTSUP`; `rename /p /q` → `ENOTSUP`; `unlink /p`; `diff` → `D ? /p`.
 32. Keep overlay A open; `openMerged` of its database → `EBUSY`; `deleteOverlay` → `EBUSY`; close A; `openMerged` succeeds.
-33. Set `version` to `2`; `openMerged` → `ENOTSUP`; the rows of `fs_overlay_config`, `fs_whiteout` and `fs_origin` are unchanged.
+33. `close`; set `version` to `2` through a separate raw database connection, then close that connection; `openMerged` → `ENOTSUP`; the rows of `fs_overlay_config`, `fs_whiteout` and `fs_origin` are unchanged.
 34. `createOverlay(db, base)`; `openMerged(db, other directory)` → `ESTALE`; `openMerged(plain AgentFS database)` without base → `EINVAL`.
-35. Legacy Rust database (`unlink /f`, `write /d/x "x2"`); `openMerged` with base → `version` `1`; the `fs_whiteout` rows are unchanged; `fs_origin` → `/d`, `/d/x`; `diff` → `M d /d; M f /d/x; D f /f`.
+35. Legacy Rust database (`unlink /f`, `write /d/x "x2"`, `rename /d/x /d/z`); `openMerged` with base → `version` `1`; the `fs_whiteout` rows are unchanged; every `fs_origin` row is kept with `lower_path` NULL; `read /d/z` → `x2`; `diff` → `M d /d; D f /d/x; A f /d/z; D f /f`.
 36. Legacy Go database with a whiteout row for `/f`: `openMerged` without base → `EINVAL`; with base → `version` `1`; `fs_whiteout` has row `/f` and no `parent_path` column; `stat /f` → `ENOENT`.
 37. `createOverlay(dir/a.db, base)`; again → `EEXIST`; `listOverlays(dir)` and `listOverlays(dir, base)` → `dir/a.db`; `listOverlays(dir, other directory)` → empty; `deleteOverlay(dir/a.db)`; `listOverlays(dir)` → empty.
+38. Directories A and B have the same root `st_ino` on different filesystems (on Linux: `/dev/shm` and `/dev`). `createOverlay(dir/a.db, A)`; `openMerged(dir/a.db, B)` → `ESTALE`; `listOverlays(dir, B)` → empty.
+39. On a private copy of the base: `write /d/x "x2"`; `close`; set base `/f` to `edited` and base `/d/x` to `b2`; `openMerged` without base; `read /f` → `edited`; `read /d/x` → `x2`; `diff` → `M d /d; M f /d/x`.
 
 ## Key-Value Data
 
