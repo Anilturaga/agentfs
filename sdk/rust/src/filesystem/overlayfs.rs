@@ -413,14 +413,20 @@ impl OverlayFS {
     ///
     /// The origin mapping only holds copy-ups made in this session. When the
     /// origin has a live Base overlay inode, that inode is reused for stable
-    /// numbering and now points at the delta entry.
+    /// numbering and now points at the delta entry. An inode that already follows
+    /// another delta entry, or still stands for a lower path other than `path`
+    /// (a lower hard link), is not rebound.
     fn delta_overlay_ino(&self, delta_ino: i64, path: &str) -> i64 {
         let ino = self.get_or_create_overlay_ino(Layer::Delta, delta_ino, path);
         let origin_ino = self.get_origin_ino(delta_ino).and_then(|base_ino| {
             let reverse = self.reverse_map.read().unwrap();
             reverse.get(&(Layer::Base, base_ino)).copied()
         });
-        let Some(existing_ino) = origin_ino else {
+        let reusable = |existing: i64| {
+            existing == ino
+                || matches!(self.get_inode_info(existing), Some(i) if i.layer == Layer::Base && i.path == path)
+        };
+        let Some(existing_ino) = origin_ino.filter(|&e| reusable(e)) else {
             return ino;
         };
         self.refresh_overlay_mapping(existing_ino, Layer::Delta, delta_ino, path);
@@ -1287,36 +1293,41 @@ impl FileSystem for OverlayFS {
         }
 
         // Collect the lower-backed entries of the merged subtree, parents first, and
-        // refuse before any copy-up if one of them is a special file.
+        // refuse before any copy-up if one of them is a special file. An entry is
+        // lower-backed if its directory has no delta dentry for it.
+        let src_delta = match self.resolve_delta_parent(&old_parent_info).await? {
+            Some(dir) => FileSystem::lookup(&self.delta, dir, oldname).await?,
+            None => None,
+        };
         let mut lower = Vec::new();
-        let mut pending = vec![(old_path.clone(), src_stats)];
-        while let Some((path, stats)) = pending.pop() {
-            if let Some(info) = self
-                .get_inode_info(stats.ino)
-                .filter(|i| i.layer == Layer::Base)
-            {
+        let mut pending = vec![(old_path.clone(), src_stats, src_delta.map(|s| s.ino))];
+        while let Some((path, stats, delta_ino)) = pending.pop() {
+            if delta_ino.is_none() {
                 if !(stats.is_file() || stats.is_directory() || stats.is_symlink()) {
                     return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into());
                 }
-                lower.push((path.clone(), stats.ino, info.underlying_ino));
+                lower.push((path.clone(), stats.ino));
             }
             if stats.is_directory() {
-                let children = self.readdir_plus(stats.ino).await?.unwrap_or_default();
-                pending.extend(
-                    children
-                        .into_iter()
-                        .map(|e| (format!("{path}/{}", e.name), e.stats)),
-                );
+                for entry in self.readdir_plus(stats.ino).await?.unwrap_or_default() {
+                    let child = match delta_ino {
+                        Some(dir) => FileSystem::lookup(&self.delta, dir, &entry.name).await?,
+                        None => None,
+                    };
+                    let child_path = format!("{path}/{}", entry.name);
+                    pending.push((child_path, entry.stats, child.map(|s| s.ino)));
+                }
             }
         }
         // Lower hard links share one overlay inode, so copy up by path: the entry
         // that owns the inode mapping follows into the delta, the others copy alone.
-        for (path, ino, base_ino) in lower {
+        for (path, ino) in lower {
             match self.get_inode_info(ino) {
                 Some(i) if i.layer == Layer::Base && i.path == path => {
                     self.copy_up_and_update_mapping(ino).await?;
                 }
                 _ => {
+                    let base_ino = self.lower_ino(&path).await?.ok_or(FsError::NotFound)?;
                     let _promoting = self.promote.lock().await;
                     self.copy_up(&path, base_ino).await?;
                 }
@@ -3042,6 +3053,67 @@ mod tests {
         let x2 = overlay.lookup(moved.ino, "x2").await?.unwrap();
         let file = overlay.open(x2.ino, libc::O_RDONLY).await?;
         assert_eq!(file.pread(0, 10).await?, b"x");
+
+        Ok(())
+    }
+
+    fn hard_linked_base() -> Result<tempfile::TempDir> {
+        let base_dir = tempdir()?;
+        std::fs::create_dir(base_dir.path().join("d"))?;
+        std::fs::write(base_dir.path().join("d/x"), b"x")?;
+        std::fs::hard_link(base_dir.path().join("d/x"), base_dir.path().join("d/x2"))?;
+        std::fs::hard_link(base_dir.path().join("d/x"), base_dir.path().join("o"))?;
+        Ok(base_dir)
+    }
+
+    async fn mode_of(overlay: &OverlayFS, dir: i64, name: &str) -> Result<u32> {
+        Ok(overlay.lookup(dir, name).await?.unwrap().mode & 0o777)
+    }
+
+    #[tokio::test]
+    async fn test_overlay_rename_dir_with_partly_copied_up_hard_links() -> Result<()> {
+        let base_dir = hard_linked_base()?;
+        let delta_dir = tempdir()?;
+        let db = delta_dir.path().join("delta.db");
+
+        let overlay = open_overlay(base_dir.path(), &db).await?;
+        let d = overlay.lookup(ROOT_INO, "d").await?.unwrap();
+        let x = overlay.lookup(d.ino, "x").await?.unwrap();
+        overlay.chmod(x.ino, 0o600).await?;
+        overlay.rename(ROOT_INO, "d", ROOT_INO, "m").await?;
+
+        for overlay in [overlay, open_overlay(base_dir.path(), &db).await?] {
+            let m = overlay.lookup(ROOT_INO, "m").await?.unwrap();
+            assert_eq!(overlay.readdir(m.ino).await?.unwrap(), ["x", "x2"]);
+            assert_eq!(mode_of(&overlay, m.ino, "x").await?, 0o600);
+            assert_ne!(mode_of(&overlay, m.ino, "x2").await?, 0o600);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_moved_hard_links_are_separate_entries() -> Result<()> {
+        let base_dir = hard_linked_base()?;
+        let delta_dir = tempdir()?;
+        let db = delta_dir.path().join("delta.db");
+
+        let overlay = open_overlay(base_dir.path(), &db).await?;
+        overlay.lookup(ROOT_INO, "d").await?.unwrap();
+        overlay.rename(ROOT_INO, "d", ROOT_INO, "m").await?;
+        let m = overlay.lookup(ROOT_INO, "m").await?.unwrap();
+        let x = overlay.lookup(m.ino, "x").await?.unwrap();
+        let x2 = overlay.lookup(m.ino, "x2").await?.unwrap();
+        assert_ne!(x.ino, x2.ino);
+        overlay.chmod(x.ino, 0o600).await?;
+
+        let reopened = open_overlay(base_dir.path(), &db).await?;
+        for overlay in [overlay, reopened] {
+            let m = overlay.lookup(ROOT_INO, "m").await?.unwrap();
+            assert_eq!(mode_of(&overlay, m.ino, "x").await?, 0o600);
+            assert_ne!(mode_of(&overlay, m.ino, "x2").await?, 0o600);
+            assert_ne!(mode_of(&overlay, ROOT_INO, "o").await?, 0o600);
+        }
 
         Ok(())
     }
