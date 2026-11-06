@@ -767,6 +767,9 @@ impl OverlayFS {
 
     /// `EEXIST` if the merged view already has an entry `name` in `parent_ino`
     async fn ensure_absent(&self, parent_ino: i64, name: &str) -> Result<()> {
+        if name.len() > super::MAX_NAME_LEN {
+            return Err(FsError::NameTooLong.into());
+        }
         match self.lookup(parent_ino, name).await? {
             Some(_) => Err(FsError::AlreadyExists.into()),
             None => Ok(()),
@@ -3567,6 +3570,29 @@ mod tests {
             .await?
             .is_none());
         assert!(FileSystem::lookup(overlay.delta(), 1, dir).await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_create_under_delta_dir_over_non_directory_lower() -> Result<()> {
+        let (overlay, base_dir, _delta_dir) = create_test_overlay().await?;
+        let (n, _) = overlay
+            .create_file(ROOT_INO, "n", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        let upper = overlay.mkdir(ROOT_INO, "upper", 0o755, 0, 0).await?;
+        std::fs::write(base_dir.path().join("upper"), b"now a file")?;
+
+        overlay
+            .create_file(upper.ino, "a", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        overlay.mknod(upper.ino, "b", 0o10644, 0, 0, 0).await?;
+        overlay.symlink(upper.ino, "c", "x", 0, 0).await?;
+        overlay.link(n.ino, upper.ino, "d").await?;
+
+        for name in ["a", "b", "c", "d"] {
+            assert!(overlay.lookup(upper.ino, name).await?.is_some(), "{name}");
+        }
 
         Ok(())
     }
