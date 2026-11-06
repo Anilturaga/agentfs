@@ -142,8 +142,9 @@ function notSupported(name: string): () => never {
  * const agent = await AgentFS.openWith(db);
  * ```
  */
-export function createServerlessAdapter(conn: Connection): DatabasePromise {
+export function createServerlessAdapter(conn: Connection): DatabasePromise & { lockless: true } {
   return {
+    lockless: true,
     name: "serverless",
     readonly: false,
     open: true,
@@ -192,5 +193,5 @@ export function createServerlessAdapter(conn: Connection): DatabasePromise {
     async close(): Promise<void> {
       await conn.close();
     },
-  } as unknown as DatabasePromise;
+  } as unknown as DatabasePromise & { lockless: true };
 }

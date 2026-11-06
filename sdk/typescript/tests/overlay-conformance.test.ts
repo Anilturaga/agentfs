@@ -8,6 +8,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 interface Case {
   id: number;
   xfail_ts?: number[];
+  na_ts?: string;
   timeout?: number;
 }
 
@@ -62,11 +63,11 @@ function judge(c: Case, r: Outcome): void {
 }
 
 describe('overlay conformance', () => {
-  afterAll(() => console.log(`pass ${tally.pass}, xfail ${tally.xfail}, fail ${tally.fail}`));
+  afterAll(() => console.log(`pass ${tally.pass}, xfail ${tally.xfail}, fail ${tally.fail}, n/a ${cases.filter((c) => c.na_ts).length}`));
 
   cases.forEach((c, index) => {
     const seconds = c.timeout ?? 30;
-    it(`case ${c.id}`, { timeout: (seconds + 10) * 1000 }, async () => {
+    (c.na_ts ? it.skip : it)(`case ${c.id}`, { timeout: (seconds + 10) * 1000 }, async () => {
       judge(c, await runGroup('node', [`${tests}overlay-conformance-worker.mjs`, String(index)], seconds));
     });
   });
