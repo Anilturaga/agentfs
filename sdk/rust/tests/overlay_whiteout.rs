@@ -127,6 +127,39 @@ async fn recreated_directory_stays_opaque_over_base() {
 }
 
 #[tokio::test]
+async fn delta_directory_over_a_base_non_directory_stays_usable() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = make_base(dir.path());
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("secret"), "s").unwrap();
+
+    for (i, base_is_symlink) in [false, true].into_iter().enumerate() {
+        let db = dir.path().join(format!("o{i}.db"));
+        let overlay = open(&db, &base).await;
+        let k = overlay.mkdir(1, "k", 0o755, 0, 0).await.unwrap();
+        overlay.create_file(k.ino, "a", 0o644, 0, 0).await.unwrap();
+        drop(overlay);
+
+        let path = base.join("k");
+        if base_is_symlink {
+            std::os::unix::fs::symlink(&outside, &path).unwrap();
+        } else {
+            std::fs::write(&path, "now a file").unwrap();
+        }
+        let overlay = open(&db, &base).await;
+        let k = overlay.lookup(1, "k").await.unwrap().unwrap();
+        assert!(k.is_directory());
+        assert_eq!(overlay.readdir(k.ino).await.unwrap().unwrap(), ["a"]);
+        assert_eq!(overlay.readdir_plus(k.ino).await.unwrap().unwrap().len(), 1);
+        assert!(overlay.lookup(k.ino, "secret").await.unwrap().is_none());
+        overlay.create_file(k.ino, "b", 0o644, 0, 0).await.unwrap();
+        assert_eq!(overlay.readdir(k.ino).await.unwrap().unwrap(), ["a", "b"]);
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn opaque_directory_ignores_a_changed_base() {
     let dir = tempfile::tempdir().unwrap();
     let base = make_base(dir.path());
