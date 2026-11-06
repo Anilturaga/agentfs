@@ -616,7 +616,24 @@ impl OverlayFS {
         if info.layer == Layer::Base {
             return Ok(Some(info.underlying_ino));
         }
-        Ok(self.lower_stat(&info.path).await?.map(|s| s.ino))
+        Ok(self
+            .lower_stat(&info.path)
+            .await?
+            .filter(Stats::is_directory)
+            .map(|s| s.ino))
+    }
+
+    /// Base directory `name` inside the base directory `dir`. `None` if `dir` is
+    /// `None` or the base entry is not a directory.
+    async fn base_subdir(&self, dir: Option<i64>, name: &str) -> Result<Option<Stats>> {
+        Ok(match dir {
+            Some(dir) => self
+                .base
+                .lookup(dir, name)
+                .await?
+                .filter(Stats::is_directory),
+            None => None,
+        })
     }
 
     /// Get inode info for an overlay inode
@@ -754,7 +771,7 @@ impl OverlayFS {
 
         let mut current_path = String::new();
         let mut current_delta_ino: i64 = 1; // Delta root
-        let mut current_base_ino: i64 = 1; // Base root
+        let mut current_base_ino = Some(1); // Base root; `None` once the base has no directory
 
         for component in components.iter().take(components.len().saturating_sub(1)) {
             current_path = format!("{}/{}", current_path, component);
@@ -766,9 +783,10 @@ impl OverlayFS {
                 if stats.is_directory() {
                     current_delta_ino = stats.ino;
                     // Advance base in parallel so it stays in sync
-                    if let Some(bs) = self.base.lookup(current_base_ino, component).await? {
-                        current_base_ino = bs.ino;
-                    }
+                    current_base_ino = self
+                        .base_subdir(current_base_ino, component)
+                        .await?
+                        .map(|s| s.ino);
                     continue;
                 } else {
                     return Err(FsError::NotADirectory.into());
@@ -776,11 +794,10 @@ impl OverlayFS {
             }
 
             // Not in delta, check base (using the base inode, not delta inode)
-            let base_stats = self.base.lookup(current_base_ino, component).await?;
+            let base_stats = self.base_subdir(current_base_ino, component).await?;
+            current_base_ino = base_stats.as_ref().map(|s| s.ino);
             let (dir_mode, dir_uid, dir_gid, origin_base_ino) = if let Some(s) = &base_stats {
-                let base_ino = s.ino;
-                current_base_ino = base_ino;
-                (s.mode & 0o7777, s.uid, s.gid, Some(base_ino))
+                (s.mode & 0o7777, s.uid, s.gid, Some(s.ino))
             } else {
                 (0o755, uid, gid, None)
             };
@@ -983,25 +1000,8 @@ impl FileSystem for OverlayFS {
         }
 
         // Try base
-        let base_parent_ino = if parent_info.layer == Layer::Base {
-            parent_info.underlying_ino
-        } else {
-            // Need to find corresponding base parent by path
-            // For root, use base root (1)
-            if parent_info.path == "/" {
-                1
-            } else {
-                // Walk the base to find the parent
-                let mut base_ino: i64 = 1;
-                for comp in parent_info.path.split('/').filter(|s| !s.is_empty()) {
-                    if let Some(s) = self.base.lookup(base_ino, comp).await? {
-                        base_ino = s.ino;
-                    } else {
-                        return Ok(None);
-                    }
-                }
-                base_ino
-            }
+        let Some(base_parent_ino) = self.base_dir_ino(&parent_info).await? else {
+            return Ok(None);
         };
 
         if let Some(base_stats) = self.base.lookup(base_parent_ino, name).await? {
