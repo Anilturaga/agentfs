@@ -667,7 +667,7 @@ Every SDK exposes these operations in its own naming style. `base` is a host dir
 - `openMerged(dbPath, base?) → MergedFS` - If `dbPath` does not exist, fail with `ENOENT`. Take the lock (Writer Policy). Classify the database (Versioning and Migration). Without `base`, use the host adapter at `base_path`: fail with `EINVAL` if there is no `base_path`, and with `ENOENT` if the directory does not exist. For a v1 database, if the base identity is not `base_identity`, fail with `ESTALE`. Where storage has no path, `dbPath` is an SDK-native database handle.
 - `MergedFS` - The SDK's filesystem interface with the semantics of this section, plus `diff()` and `close()`. `close()` releases the lock.
 - `MergedFS.diff() → Change[]` - See Diff.
-- `listOverlays(dir, base?) → OverlayInfo[]` - Read each regular file named `*.db` directly in `dir` that has `fs_overlay_config`. Skip files that cannot be read (for example encrypted or hard-linked databases). With `base`, keep only overlays whose `base_identity` is the identity of `base` (legacy: whose `base_path` is its canonical path). Sort by path.
+- `listOverlays(dir, base?) → OverlayInfo[]` - Read each regular file named `*.db` directly in `dir` that has `fs_overlay_config`. Skip files that cannot be read (for example encrypted databases). With `base`, keep only overlays whose `base_identity` is the identity of `base` (legacy: whose `base_path` is its canonical path). Sort by path.
 - `deleteOverlay(dbPath)` - If `dbPath` does not exist, fail with `ENOENT`. Take the lock. If the database has no `fs_overlay_config`, fail with `EINVAL`. Delete `dbPath` and its engine sidecar files (`-wal`, `-shm`, `-log`, `-wal-revert`, `-info`, `-changes`). If `dbPath` is a symlink, delete its target and the target's sidecar files, and keep the symlink.
 - `rebindOverlay(dbPath, base)` - If `dbPath` does not exist, fail with `ENOENT`. Take the lock. If `version` is absent, fail with `EINVAL`; if it is not `1`, fail with `ENOTSUP`. In one transaction, overwrite `base_path` and `base_identity` with the locator and identity of `base`. Only this explicit call rebinds; `openMerged` never rebinds.
 - `OverlayInfo` - `{ path, version, basePath, baseIdentity }`. A legacy overlay has `version` 0 and an empty `baseIdentity`.
@@ -876,7 +876,7 @@ Such extensions SHOULD use separate tables to maintain referential integrity.
 - `listOverlays` reads without the lock only where the storage engine allows it. Where it does not (the Rust SDK on turso 0.4.4), it takes the lock for each read and MAY omit a database that another instance holds open
 - Versioning and Migration: SDKs other than the reference MAY reject legacy databases with `ENOTSUP`
 - Writer Policy: the TypeScript SDK on Node has no OS file lock, so it does not support another process that deletes or recreates the same overlay database at the same time
-- An overlay database file with a link count above 1 fails with `ENOTSUP`, and `listOverlays` skips it
+- An overlay database file with a link count above 1 fails with `ENOTSUP`
 - Management operations resolve the symlinks in `dbPath` before the storage engine opens it. `deleteOverlay` through a symlink deletes the target and its sidecar files
 - The overlay format version stays 1 and the schema does not change
 
