@@ -1,6 +1,6 @@
 # Overlay conformance cases
 
-`cases.json` encodes the 42 cases of SPEC.md "Conformance Cases". Every SDK runner executes all of them.
+`cases.json` encodes the 42 cases of SPEC.md "Conformance Cases", plus case 43 (a delta directory whose base path became a file). Every SDK runner executes all of them.
 
 - `base`: a POSIX shell script that builds the shared base tree in an empty directory (`umask 022`; `d` has mode 750). Each case gets a fresh copy and a new overlay on it.
 - `cases[]`: `id` (the spec number), `steps`, optional `xfail`, optional `timeout` (seconds, default 30). A case that exceeds its timeout fails and its worker must be killed.
