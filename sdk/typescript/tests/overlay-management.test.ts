@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Database } from '@tursodatabase/database';
 import { execFileSync, spawn } from 'node:child_process';
-import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -112,6 +112,36 @@ describe('overlay management', () => {
     expect(await listOverlays(root)).toEqual([]);
     expect(readFileSync(db).equals(before)).toBe(true);
     expect(readdirSync(root)).toEqual(names);
+  });
+
+  it('shares one database and one set of sidecars between a symlink and its target', async () => {
+    const alias = join(root, 'alias.db');
+    await createOverlay(db, base);
+    symlinkSync(db, alias);
+    for (const [writer, reader, name] of [[alias, db, '/via-alias'], [db, alias, '/via-real']]) {
+      overlay = await openMerged(writer, base);
+      await overlay.writeFile(name, name);
+      await overlay.close();
+      overlay = await openMerged(reader, base);
+      expect(await overlay.readFile(name, 'utf8')).toBe(name);
+      await overlay.close();
+    }
+    overlay = undefined;
+    expect(existsSync(`${alias}-wal`)).toBe(false);
+  });
+
+  it('deletes the target of a symlink with its sidecars and leaves the symlink dangling', async () => {
+    const alias = join(root, 'alias.db');
+    await createOverlay(db, base);
+    symlinkSync(db, alias);
+    overlay = await openMerged(alias, base);
+    await overlay.writeFile('/work', 'x');
+    await overlay.close();
+    overlay = undefined;
+    expect(existsSync(`${db}-wal`)).toBe(true);
+    await deleteOverlay(alias);
+    expect(readdirSync(root).sort()).toEqual(['alias.db', 'base']);
+    expect(lstatSync(alias).isSymbolicLink()).toBe(true);
   });
 
   it('rebinds to a base, refuses a held database, and rejects other versions', async () => {
