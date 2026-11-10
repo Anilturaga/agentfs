@@ -49,6 +49,19 @@ struct ConnectionPoolInner {
     keep: OnceLock<Arc<dyn Any + Send + Sync>>,
 }
 
+/// `path` with symlinks resolved, so every spelling of one file reaches the engine, which names
+/// its sidecars after the path, as the same path. A path that does not exist is returned as is.
+pub(crate) fn resolve(path: &str) -> Result<String> {
+    match std::fs::canonicalize(path) {
+        Ok(real) => real
+            .into_os_string()
+            .into_string()
+            .map_err(|real| Error::InvalidUtf8Path(format!("{real:?}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path.to_string()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl ConnectionPool {
     /// Create a new connection pool from a database.
     pub fn new(db: Database) -> Self {

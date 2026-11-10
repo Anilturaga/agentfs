@@ -352,6 +352,35 @@ async fn delete_through_a_symlink_removes_the_real_database_and_its_sidecars() {
 }
 
 #[tokio::test]
+async fn rebind_through_a_symlink_rebinds_the_real_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = overlay(dir.path(), "o.db").await;
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&db, &alias).unwrap();
+    let other = make_base(dir.path(), "other");
+    rebind_overlay(opts(&alias), &other).await.unwrap();
+    assert!(!sidecar(&alias).exists());
+    open_merged(opts(&db), Some(other)).await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn database_behind_a_non_utf8_path_is_refused_before_any_engine_work() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (db, base) = overlay(dir.path(), "o.db").await;
+    let odd = dir.path().join(std::ffi::OsStr::from_bytes(b"\xff.db"));
+    std::fs::rename(&db, &odd).unwrap();
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&odd, &alias).unwrap();
+    let refused = |e: Option<Error>| assert!(matches!(e, Some(Error::InvalidUtf8Path(_))));
+    refused(open_merged(opts(&alias), None).await.err());
+    refused(delete_overlay(opts(&alias)).await.err());
+    refused(rebind_overlay(opts(&alias), &base).await.err());
+    assert!(odd.exists() && !sidecar(&alias).exists());
+}
+
+#[tokio::test]
 async fn path_fs_resolves_dot_dot_and_symlinks() {
     let dir = tempfile::tempdir().unwrap();
     let agent = AgentFS::open(opts(&dir.path().join("p.db"))).await.unwrap();
