@@ -690,6 +690,7 @@ Every SDK exposes these operations in its own naming style. `base` is a host dir
 | `link` with a lower-backed source (hard link across layers) | `EXDEV` |
 | Copy-up or `open` of a lower special file | `ENOTSUP` |
 | An overlay format version other than 1 | `ENOTSUP` |
+| An overlay database file with a link count above 1 (hard-linked) | `ENOTSUP` |
 | An overlay on storage that allows concurrent clients without a lock | `ENOTSUP` |
 | A base whose identity is not `base_identity` (recover with `rebindOverlay`) | `ESTALE` |
 | A write or truncate through a handle whose lower-backed entry was removed or replaced before copy-up | `ENOENT` |

@@ -2,6 +2,7 @@
 
 import asyncio
 import errno
+import fcntl
 import gc
 import json
 import os
@@ -14,6 +15,7 @@ from pathlib import Path
 import pytest
 from turso.aio import connect
 
+import agentfs_sdk.overlay as overlay_module
 from agentfs_sdk import (
     AgentFS,
     AgentFSOptions,
@@ -21,7 +23,10 @@ from agentfs_sdk import (
     Filesystem,
     HostAdapter,
     create_overlay,
+    delete_overlay,
+    list_overlays,
     open_merged,
+    rebind_overlay,
 )
 
 REPO = Path(__file__).resolve().parents[3]
@@ -95,6 +100,37 @@ async def code(coro) -> str:
     with pytest.raises(ErrnoException) as excinfo:
         await coro
     return excinfo.value.code
+
+
+OPEN_CODE = """
+    async def main():
+        try:
+            await open_merged(sys.argv[1], sys.argv[2])
+        except OSError as e:
+            print(e.code)
+    asyncio.run(main())
+"""
+
+
+DELETE = """
+    from agentfs_sdk import delete_overlay
+    async def main():
+        try:
+            await delete_overlay(sys.argv[1])
+        except OSError as e:
+            print(e.code)
+    asyncio.run(main())
+"""
+
+
+def child_delete_code(db) -> str:
+    """The error code of `delete_overlay` in another process; empty if it deleted."""
+    return child(DELETE, str(db)).communicate(timeout=30)[0].strip()
+
+
+def child_open_code(db, base) -> str:
+    """The error code of `open_merged` in another process; empty if it opened."""
+    return child(OPEN_CODE, str(db), str(base)).communicate(timeout=30)[0].strip()
 
 
 def child_opens(db, base) -> bool:
@@ -522,3 +558,216 @@ async def test_handle_after_ancestor_became_symlink_loop_is_enoent(overlay, base
         await fs.rm("/d")
         await fs.symlink("f", "/d")
         assert await code(handle.pwrite(0, b"z")) == "ENOENT"
+
+
+SIDECARS = ("-wal", "-shm", "-log", "-wal-revert", "-info", "-changes")
+
+
+async def plain_db(path):
+    await (await AgentFS.open(AgentFSOptions(path=str(path)))).close()
+    gc.collect()
+
+
+async def test_management_errors(tmp_path, base, overlay):
+    other = tmp_path / "other"
+    other.mkdir()
+    missing, plain, v2 = tmp_path / "missing.db", tmp_path / "plain.db", tmp_path / "v2.db"
+    await plain_db(plain)
+    await create_overlay(v2, base)
+    await raw(
+        v2, lambda c: c.execute("UPDATE fs_overlay_config SET value = '2' WHERE key = 'version'")
+    )
+
+    for db in (missing, plain, v2):
+        want = {missing: "ENOENT", plain: "EINVAL", v2: "ENOTSUP"}[db]
+        assert await code(rebind_overlay(db, base)) == want
+    assert await code(delete_overlay(missing)) == "ENOENT"
+    assert await code(delete_overlay(plain)) == "EINVAL"
+    assert not missing.exists() and plain.exists()
+
+    holder = child(HOLD, str(overlay), str(base), stdin=subprocess.PIPE)
+    try:
+        assert holder.stdout.readline() == "ready\n"
+        assert await code(delete_overlay(overlay)) == "EBUSY"
+        assert await code(rebind_overlay(overlay, other)) == "EBUSY"
+    finally:
+        holder.communicate("\n", timeout=30)
+    assert await code(open_merged(overlay, other)) == "ESTALE"
+
+    await delete_overlay(overlay)
+    assert not overlay.exists()
+
+
+async def test_hard_linked_database_is_refused(tmp_path, base, overlay):
+    os.link(overlay, tmp_path / "alias")
+    before = sorted(p.name for p in tmp_path.iterdir()), overlay.read_bytes()
+    for attempt in (
+        open_merged(overlay, base),
+        delete_overlay(overlay),
+        rebind_overlay(overlay, base),
+    ):
+        assert await code(attempt) == "ENOTSUP"
+    assert await list_overlays(tmp_path) == []
+    assert (sorted(p.name for p in tmp_path.iterdir()), overlay.read_bytes()) == before
+
+
+async def test_list_overlays(tmp_path, base, overlay):
+    other = tmp_path / "other"
+    other.mkdir()
+    shutil.copyfile(LEGACY_RUST_DB, tmp_path / "legacy.db")
+    update = f"UPDATE fs_overlay_config SET value = '{base}' WHERE key = 'base_path'"
+    await raw(tmp_path / "legacy.db", lambda c: c.execute(update))
+    await plain_db(tmp_path / "plain.db")
+    (tmp_path / "garbage.db").write_text("not a database")
+    (tmp_path / "dir.db").mkdir()
+    (tmp_path / "notes.txt").write_text("x")
+
+    listed = await list_overlays(tmp_path)
+    assert [(i.path, i.version) for i in listed] == [
+        (str(tmp_path / "legacy.db"), 0),
+        (str(overlay), 1),
+    ]
+    assert listed[0].base_identity == "" and listed[1].base_path == str(base.resolve())
+    assert await list_overlays(tmp_path, base) == listed
+    assert await list_overlays(tmp_path, other) == []
+
+
+async def test_delete_holds_lock_until_removed(tmp_path, base, overlay, monkeypatch):
+    checked, remove = [], os.remove
+
+    def spy(path, *args, **kwargs):
+        first = not checked
+        if first or str(path) == str(overlay):
+            checked.append(child_open_code(overlay, base))
+        if first:
+            for suffix in SIDECARS:
+                Path(f"{overlay}{suffix}").touch()
+        remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", spy)
+    await delete_overlay(overlay)
+    monkeypatch.undo()
+    assert checked == ["EBUSY", "EBUSY"]
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("o.db")] == []
+    assert child_open_code(overlay, base) == "ENOENT"
+
+
+async def test_list_keeps_open_overlay_locked(tmp_path, base, overlay):
+    async with await open_merged(overlay, base) as fs:
+        assert [i.path for i in await list_overlays(tmp_path, base)] == [str(overlay)]
+        assert child_open_code(overlay, base) == "EBUSY"
+        await fs.write_file("/n", "x")
+        assert await fs.read_file("/n") == "x"
+
+
+async def test_management_releases_lock(tmp_path, base, overlay):
+    other = tmp_path / "other"
+    other.mkdir()
+    await list_overlays(tmp_path)
+    assert child_opens(overlay, base)
+    await rebind_overlay(overlay, other)
+    assert child_opens(overlay, other)
+    assert await code(open_merged(overlay, base)) == "ESTALE"
+
+
+async def test_listing_does_not_resurrect_deleted_database(tmp_path, base, overlay, monkeypatch):
+    real_open, deleted = os.open, []
+
+    def delete_before_open(path, *args, **kwargs):
+        if str(path) == str(overlay) and not deleted:
+            deleted.append(child_delete_code(overlay))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", delete_before_open)
+    assert await list_overlays(tmp_path) == []
+    monkeypatch.undo()
+    assert deleted == [""]
+    assert not overlay.exists()
+    await create_overlay(overlay, base)
+
+
+async def test_listing_pins_database_against_delete(tmp_path, base, overlay, monkeypatch):
+    real_connect, deleted = overlay_module.connect, []
+
+    def delete_before_connect(path):
+        deleted.append(child_delete_code(overlay))
+        return real_connect(path)
+
+    monkeypatch.setattr(overlay_module, "connect", delete_before_connect)
+    assert [i.path for i in await list_overlays(tmp_path)] == [str(overlay)]
+    monkeypatch.undo()
+    assert deleted == ["EBUSY"]
+    assert overlay.exists()
+
+
+async def test_listing_skips_entries_that_disappear(tmp_path, overlay, monkeypatch):
+    gone, notes = tmp_path / "gone.db", tmp_path / "notes.txt"
+    gone.write_text("x")
+    notes.write_text("x")
+    seen, real_lstat = [], os.lstat
+
+    def vanish(path, *args, **kwargs):
+        seen.append(Path(path).name)
+        if Path(path) == gone:
+            gone.unlink()
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", vanish)
+    assert [i.path for i in await list_overlays(tmp_path)] == [str(overlay)]
+    monkeypatch.undo()
+    assert "gone.db" in seen and "notes.txt" not in seen
+
+
+async def test_failed_acquisition_keeps_the_lock_of_the_owner(tmp_path, base, overlay, monkeypatch):
+    other = tmp_path / "other.db"
+    await create_overlay(other, base)
+    link = tmp_path / "link"
+    link.symlink_to(other)
+    real_open, real_connect, seen = os.open, overlay_module.connect, []
+
+    def retarget(path, *args, **kwargs):
+        if str(path) == str(link):
+            link.unlink()
+            link.symlink_to(overlay)
+        return real_open(path, *args, **kwargs)
+
+    async def acquire_meanwhile(path):
+        if not seen:
+            monkeypatch.setattr(os, "open", retarget)
+            seen.append(await code(open_merged(link, base)))
+            monkeypatch.setattr(os, "open", real_open)
+            seen.append(child_delete_code(overlay))
+        return await real_connect(path)
+
+    monkeypatch.setattr(overlay_module, "connect", acquire_meanwhile)
+    assert [i.path for i in await list_overlays(tmp_path)] == [str(overlay), str(other)]
+    monkeypatch.undo()
+    assert seen == ["ENOENT", "EBUSY"]
+    assert overlay.exists()
+
+
+@pytest.mark.parametrize("hook", ["open", "lockf"])
+async def test_late_hard_link_is_refused(hook, tmp_path, base, overlay, monkeypatch):
+    alias = tmp_path / "alias"
+    owner = os if hook == "open" else fcntl
+    real = getattr(owner, hook)
+
+    def link_around(*args, **kwargs):
+        if hook == "open" and str(args[0]) == str(overlay):
+            os.link(overlay, alias)
+        result = real(*args, **kwargs)
+        if hook == "lockf":
+            os.link(overlay, alias)
+        return result
+
+    for operation in (
+        lambda: open_merged(overlay, base),
+        lambda: delete_overlay(overlay),
+        lambda: rebind_overlay(overlay, base),
+    ):
+        monkeypatch.setattr(owner, hook, link_around)
+        assert await code(operation()) == "ENOTSUP"
+        monkeypatch.undo()
+        alias.unlink()
+        assert overlay.exists()
+    assert child_opens(overlay, base)
