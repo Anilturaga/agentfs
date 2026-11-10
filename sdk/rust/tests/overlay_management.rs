@@ -381,6 +381,36 @@ async fn database_behind_a_non_utf8_path_is_refused_before_any_engine_work() {
 }
 
 #[tokio::test]
+async fn listing_through_a_retargeted_directory_symlink_keeps_a_live_writers_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    let (a_db, _) = overlay(&a, "o.db").await;
+    overlay(&b, "o.db").await;
+    let live = open_merged(opts(&a_db), None).await.unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flip = {
+        let (stop, tmp, link) = (stop.clone(), dir.path().join("tmp"), link.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                for target in [&a, &b] {
+                    std::os::unix::fs::symlink(target, &tmp).unwrap();
+                    std::fs::rename(&tmp, &link).unwrap();
+                }
+            }
+        })
+    };
+    for _ in 0..500 {
+        list_overlays(&link, None).await.unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    flip.join().unwrap();
+    assert!(!child_can_lock(&a_db));
+    drop(live);
+}
+
+#[tokio::test]
 async fn path_fs_resolves_dot_dot_and_symlinks() {
     let dir = tempfile::tempdir().unwrap();
     let agent = AgentFS::open(opts(&dir.path().join("p.db"))).await.unwrap();

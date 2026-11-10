@@ -103,7 +103,7 @@ fn not_overlay(db: &str) -> Error {
     fail(libc::EINVAL, format!("not an overlay database: {db}"))
 }
 
-fn key_of(path: &Path) -> std::io::Result<Key> {
+fn key_of(path: impl AsRef<Path>) -> std::io::Result<Key> {
     std::fs::metadata(path).map(|m| (m.dev(), m.ino()))
 }
 
@@ -359,7 +359,7 @@ pub async fn list_overlays(dir: impl AsRef<Path>, base: Option<&Base>) -> Result
         let (Some(file), true) = (path.to_str().and_then(|p| resolve(p).ok()), named) else {
             continue;
         };
-        let Ok(key) = key_of(&path) else { continue };
+        let Ok(key) = key_of(&file) else { continue };
         match registry().get(&key) {
             Some(Entry {
                 info: Some(info), ..
@@ -373,7 +373,7 @@ pub async fn list_overlays(dir: impl AsRef<Path>, base: Option<&Base>) -> Result
             Some(_) => continue,
             None => {}
         }
-        let Ok(held) = Reservation::acquire(&path) else {
+        let Ok(held) = Reservation::acquire(Path::new(&file)) else {
             continue;
         };
         // A panic of the storage engine on a file it cannot read ends only this task.
@@ -397,8 +397,7 @@ pub async fn list_overlays(dir: impl AsRef<Path>, base: Option<&Base>) -> Result
 }
 
 /// Deletes the overlay database `db` and its sidecar files. `ENOENT`, `EINVAL` and `EBUSY` as
-/// for `open_merged`. If `db` is a symlink, the file it resolves to is deleted and the symlink
-/// is left dangling.
+/// for `open_merged`. A symlink `db` is left dangling; its target and sidecars are deleted.
 pub async fn delete_overlay(db: AgentFSOptions) -> Result<()> {
     let path = resolve(&db.db_path()?)?;
     let held = Arc::new(Reservation::acquire(Path::new(&path))?);
