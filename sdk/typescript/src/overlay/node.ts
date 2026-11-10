@@ -79,6 +79,7 @@ export async function createOverlay(dbPath: string, base: string | LowerAdapter)
  * directory recorded in the database.
  */
 export async function openMerged(dbPath: string, base?: string | LowerAdapter): Promise<OverlayFS> {
+  dbPath = await realpath(dbPath);
   const key = await fileKey(dbPath);
   claim(key);
   const db = new Database(dbPath);
@@ -104,14 +105,15 @@ async function attach(db: Database, dbPath: string, key: string): Promise<void> 
   await same(dbPath, key);
 }
 
-/** Runs `fn` on a connection to the existing `dbPath` while holding its writer lock. */
-async function locked(dbPath: string, fn: (db: Database, key: string) => Promise<void>): Promise<void> {
+/** Runs `fn` on a connection to the existing `dbPath`, with symlinks resolved, while holding its writer lock. */
+async function locked(dbPath: string, fn: (db: Database, key: string, path: string) => Promise<void>): Promise<void> {
+  dbPath = await realpath(dbPath);
   const key = await fileKey(dbPath);
   claim(key);
   const db = new Database(dbPath);
   try {
     await attach(db, dbPath, key);
-    await fn(db, key);
+    await fn(db, key, dbPath);
   } catch (e) {
     throw lockError(e);
   } finally {
@@ -120,14 +122,14 @@ async function locked(dbPath: string, fn: (db: Database, key: string) => Promise
   }
 }
 
-/** Deletes the overlay database `dbPath` and its engine sidecar files, the main file last. Before each removal it checks that `dbPath` still names the same file. */
+/** Deletes the overlay database `dbPath` and its engine sidecar files, the main file last. Before each removal it checks that `dbPath` still names the same file. Through a symlink, it deletes the file the symlink resolves to and leaves the symlink dangling. */
 export const deleteOverlay = (dbPath: string) =>
-  locked(dbPath, async (db, key) => {
-    if (!(await readConfig(db))) fail('EINVAL', 'open', dbPath);
+  locked(dbPath, async (db, key, path) => {
+    if (!(await readConfig(db))) fail('EINVAL', 'open', path);
     await db.close();
     for (const suffix of ['-wal', '-shm', '-log', '-wal-revert', '-info', '-changes', '']) {
-      await same(dbPath, key);
-      await rm(dbPath + suffix, { force: true });
+      await same(path, key);
+      await rm(path + suffix, { force: true });
     }
   });
 

@@ -280,6 +280,19 @@ async def test_open_errors(tmp_path, base, overlay):
     assert not (tmp_path / "x.db").exists()
 
 
+async def test_symlinked_database_shares_one_set_of_sidecars(tmp_path, base, overlay):
+    alias = tmp_path / "alias.db"
+    alias.symlink_to(overlay)
+    for writer, reader, name in [(alias, overlay, "/via_alias"), (overlay, alias, "/via_real")]:
+        fs = await open_merged(writer, base)
+        await fs.write_file(name, name)
+        await fs.close()
+        fs = await open_merged(reader, base)
+        assert await fs.read_file(name) == name
+        await fs.close()
+    assert not Path(f"{alias}-wal").exists()
+
+
 async def test_non_v1_databases_are_not_migrated(tmp_path, base, overlay):
     await raw(
         overlay,

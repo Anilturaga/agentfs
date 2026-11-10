@@ -694,7 +694,7 @@ async def create_overlay(db_path: DbPath, base: Base) -> OverlayInfo:
 
 async def open_merged(db_path: DbPath, base: Base | None = None) -> OverlayFS:
     """Opens the overlay in `db_path` and holds its writer lock until `close()`."""
-    path = os.fspath(db_path)
+    path = os.path.realpath(db_path)
     if not os.path.exists(path):
         _fail("ENOENT", "open_merged", path)
     lock = _Lock()
