@@ -4,7 +4,7 @@
 //! keyed by the file's inode and a lock of our own, held until the last handle drops.
 
 use crate::{
-    connection_pool::ConnectionPool,
+    connection_pool::{resolve, ConnectionPool},
     error::{Error, Result},
     filesystem::{overlayfs::host_identity, Change},
     AgentFS, AgentFSOptions, FileSystem, HostFS, KvStore, OverlayFS, SyncOptions,
@@ -103,7 +103,7 @@ fn not_overlay(db: &str) -> Error {
     fail(libc::EINVAL, format!("not an overlay database: {db}"))
 }
 
-fn key_of(path: &Path) -> std::io::Result<Key> {
+fn key_of(path: impl AsRef<Path>) -> std::io::Result<Key> {
     std::fs::metadata(path).map(|m| (m.dev(), m.ino()))
 }
 
@@ -312,9 +312,10 @@ async fn build(
 /// `ENOENT` if the file is absent, `ESTALE` if the base is not the recorded one, `EINVAL` if
 /// it is not an overlay and `EBUSY` if it is in use.
 pub async fn open_merged(db: AgentFSOptions, base: Option<Base>) -> Result<MergedFS> {
-    let path = db.db_path()?;
+    let path = resolve(&db.db_path()?)?;
     let held = Arc::new(Reservation::acquire(Path::new(&path))?);
     let options = AgentFSOptions {
+        path: Some(path.clone()),
         base: base.as_ref().map(|b| b.path.clone().into()),
         ..db
     };
@@ -355,10 +356,10 @@ pub async fn list_overlays(dir: impl AsRef<Path>, base: Option<&Base>) -> Result
         let entry = entry?;
         let path = entry.path();
         let named = path.extension().is_some_and(|e| e == "db") && entry.file_type()?.is_file();
-        let (Some(file), true) = (path.to_str().map(str::to_string), named) else {
+        let (Some(file), true) = (path.to_str().and_then(|p| resolve(p).ok()), named) else {
             continue;
         };
-        let Ok(key) = key_of(&path) else { continue };
+        let Ok(key) = key_of(&file) else { continue };
         match registry().get(&key) {
             Some(Entry {
                 info: Some(info), ..
@@ -372,7 +373,7 @@ pub async fn list_overlays(dir: impl AsRef<Path>, base: Option<&Base>) -> Result
             Some(_) => continue,
             None => {}
         }
-        let Ok(held) = Reservation::acquire(&path) else {
+        let Ok(held) = Reservation::acquire(Path::new(&file)) else {
             continue;
         };
         // A panic of the storage engine on a file it cannot read ends only this task.
@@ -396,12 +397,10 @@ pub async fn list_overlays(dir: impl AsRef<Path>, base: Option<&Base>) -> Result
 }
 
 /// Deletes the overlay database `db` and its sidecar files. `ENOENT`, `EINVAL` and `EBUSY` as
-/// for `open_merged`. If `db` is a symlink, the file it resolves to is deleted and the symlink
-/// is left dangling.
+/// for `open_merged`. A symlink `db` is left dangling; its target and sidecars are deleted.
 pub async fn delete_overlay(db: AgentFSOptions) -> Result<()> {
-    let path = db.db_path()?;
+    let path = resolve(&db.db_path()?)?;
     let held = Arc::new(Reservation::acquire(Path::new(&path))?);
-    let path = std::fs::canonicalize(&path)?.to_string_lossy().into_owned();
     {
         let pool =
             ConnectionPool::open_held(&path, db.encryption.as_ref(), Some(held.clone())).await?;
@@ -427,7 +426,7 @@ pub async fn delete_overlay(db: AgentFSOptions) -> Result<()> {
 
 /// Binds the overlay `db` to `base`. `ENOTSUP` if its version is not 1.
 pub async fn rebind_overlay(db: AgentFSOptions, base: &Base) -> Result<()> {
-    let path = db.db_path()?;
+    let path = resolve(&db.db_path()?)?;
     let held = Arc::new(Reservation::acquire(Path::new(&path))?);
     let pool = ConnectionPool::open_held(&path, db.encryption.as_ref(), Some(held.clone())).await?;
     let conn = pool.get_connection().await?;
@@ -512,6 +511,29 @@ mod tests {
             b"wal"
         );
         assert!(!registry().contains_key(&key_of(&db).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn symlink_retargeted_after_resolving_does_not_redirect_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, base) = overlay(dir.path()).await;
+        let other = dir.path().join("other.db");
+        create_overlay(opts(&other), &base).await.unwrap();
+        let live = open_merged(opts(&other), None).await.unwrap();
+        let alias = dir.path().join("alias.db");
+        std::os::unix::fs::symlink(&db, &alias).unwrap();
+        let (link, target) = (alias.clone(), other.clone());
+        set_hook(3, move || {
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+        });
+        let opened = open_merged(opts(&alias), None).await;
+        HOOKS.with(|hooks| hooks.borrow_mut()[3] = None);
+        assert_eq!(
+            opened.unwrap().info.path,
+            std::fs::canonicalize(&db).unwrap()
+        );
+        drop(live);
     }
 
     /// Run again as a child process: exits 0 when the lock on `PROBE_DB` is refused.

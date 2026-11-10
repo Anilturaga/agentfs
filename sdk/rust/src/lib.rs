@@ -343,16 +343,12 @@ impl AgentFS {
         let mut db_path = options.db_path()?;
 
         let held = match held {
-            None => connection_pool::ConnectionPool::reserve(&db_path)?,
+            None => {
+                db_path = connection_pool::resolve(&db_path)?;
+                connection_pool::ConnectionPool::reserve(&db_path)?
+            }
             held => held,
         };
-        // The engine names its sidecars after the path it is given, so every spelling of one
-        // file must reach it as the same path.
-        if held.is_some() {
-            db_path = std::fs::canonicalize(&db_path)?
-                .to_string_lossy()
-                .into_owned();
-        }
         let meta_path = format!("{db_path}-info");
 
         // Determine if this is a synced database:
