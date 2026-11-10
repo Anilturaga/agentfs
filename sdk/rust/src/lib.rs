@@ -340,13 +340,16 @@ impl AgentFS {
             ));
         }
 
-        let db_path = options.db_path()?;
-        let meta_path = format!("{db_path}-info");
+        let mut db_path = options.db_path()?;
 
         let held = match held {
-            None => connection_pool::ConnectionPool::reserve(&db_path)?,
+            None => {
+                db_path = connection_pool::resolve(&db_path)?;
+                connection_pool::ConnectionPool::reserve(&db_path)?
+            }
             held => held,
         };
+        let meta_path = format!("{db_path}-info");
 
         // Determine if this is a synced database:
         // 1. If sync.remote_url is set, create a new synced database

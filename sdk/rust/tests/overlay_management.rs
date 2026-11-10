@@ -313,6 +313,103 @@ async fn hard_linked_database_is_refused_before_any_engine_work() {
     open_merged(opts(&db), None).await.unwrap();
 }
 
+async fn write_session(db: &Path, name: &str) {
+    let merged = open_merged(opts(db), None).await.unwrap();
+    let paths = PathFS(Arc::new(merged.fs.clone()));
+    paths.write_file(name, name.as_bytes()).await.unwrap();
+}
+
+fn sidecar(db: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-wal", db.display()))
+}
+
+#[tokio::test]
+async fn symlinked_database_shares_one_set_of_sidecars() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = overlay(dir.path(), "o.db").await;
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&db, &alias).unwrap();
+    for (writer, reader, name) in [(&alias, &db, "/via_alias"), (&db, &alias, "/via_real")] {
+        write_session(writer, name).await;
+        let merged = open_merged(opts(reader), None).await.unwrap();
+        let seen = PathFS(Arc::new(merged.fs.clone())).read_file(name).await;
+        assert_eq!(seen.unwrap().as_deref(), Some(name.as_bytes()));
+    }
+    assert!(!sidecar(&alias).exists());
+}
+
+#[tokio::test]
+async fn delete_through_a_symlink_removes_the_real_database_and_its_sidecars() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = overlay(dir.path(), "o.db").await;
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&db, &alias).unwrap();
+    write_session(&alias, "/work").await;
+    assert!(sidecar(&db).exists());
+    delete_overlay(opts(&alias)).await.unwrap();
+    assert!(!db.exists() && !sidecar(&db).exists() && !sidecar(&alias).exists());
+    assert!(alias.symlink_metadata().unwrap().is_symlink());
+}
+
+#[tokio::test]
+async fn rebind_through_a_symlink_rebinds_the_real_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = overlay(dir.path(), "o.db").await;
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&db, &alias).unwrap();
+    let other = make_base(dir.path(), "other");
+    rebind_overlay(opts(&alias), &other).await.unwrap();
+    assert!(!sidecar(&alias).exists());
+    open_merged(opts(&db), Some(other)).await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn database_behind_a_non_utf8_path_is_refused_before_any_engine_work() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (db, base) = overlay(dir.path(), "o.db").await;
+    let odd = dir.path().join(std::ffi::OsStr::from_bytes(b"\xff.db"));
+    std::fs::rename(&db, &odd).unwrap();
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&odd, &alias).unwrap();
+    let refused = |e: Option<Error>| assert!(matches!(e, Some(Error::InvalidUtf8Path(_))));
+    refused(open_merged(opts(&alias), None).await.err());
+    refused(delete_overlay(opts(&alias)).await.err());
+    refused(rebind_overlay(opts(&alias), &base).await.err());
+    assert!(odd.exists() && !sidecar(&alias).exists());
+}
+
+#[tokio::test]
+async fn listing_through_a_retargeted_directory_symlink_keeps_a_live_writers_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    let (a_db, _) = overlay(&a, "o.db").await;
+    overlay(&b, "o.db").await;
+    let live = open_merged(opts(&a_db), None).await.unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flip = {
+        let (stop, tmp, link) = (stop.clone(), dir.path().join("tmp"), link.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                for target in [&a, &b] {
+                    std::os::unix::fs::symlink(target, &tmp).unwrap();
+                    std::fs::rename(&tmp, &link).unwrap();
+                }
+            }
+        })
+    };
+    for _ in 0..500 {
+        list_overlays(&link, None).await.unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    flip.join().unwrap();
+    assert!(!child_can_lock(&a_db));
+    drop(live);
+}
+
 #[tokio::test]
 async fn path_fs_resolves_dot_dot_and_symlinks() {
     let dir = tempfile::tempdir().unwrap();
