@@ -396,10 +396,12 @@ pub async fn list_overlays(dir: impl AsRef<Path>, base: Option<&Base>) -> Result
 }
 
 /// Deletes the overlay database `db` and its sidecar files. `ENOENT`, `EINVAL` and `EBUSY` as
-/// for `open_merged`.
+/// for `open_merged`. If `db` is a symlink, the file it resolves to is deleted and the symlink
+/// is left dangling.
 pub async fn delete_overlay(db: AgentFSOptions) -> Result<()> {
     let path = db.db_path()?;
     let held = Arc::new(Reservation::acquire(Path::new(&path))?);
+    let path = std::fs::canonicalize(&path)?.to_string_lossy().into_owned();
     {
         let pool =
             ConnectionPool::open_held(&path, db.encryption.as_ref(), Some(held.clone())).await?;

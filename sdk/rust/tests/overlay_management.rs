@@ -313,6 +313,44 @@ async fn hard_linked_database_is_refused_before_any_engine_work() {
     open_merged(opts(&db), None).await.unwrap();
 }
 
+async fn write_session(db: &Path, name: &str) {
+    let merged = open_merged(opts(db), None).await.unwrap();
+    let paths = PathFS(Arc::new(merged.fs.clone()));
+    paths.write_file(name, name.as_bytes()).await.unwrap();
+}
+
+fn sidecar(db: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-wal", db.display()))
+}
+
+#[tokio::test]
+async fn symlinked_database_shares_one_set_of_sidecars() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = overlay(dir.path(), "o.db").await;
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&db, &alias).unwrap();
+    for (writer, reader, name) in [(&alias, &db, "/via_alias"), (&db, &alias, "/via_real")] {
+        write_session(writer, name).await;
+        let merged = open_merged(opts(reader), None).await.unwrap();
+        let seen = PathFS(Arc::new(merged.fs.clone())).read_file(name).await;
+        assert_eq!(seen.unwrap().as_deref(), Some(name.as_bytes()));
+    }
+    assert!(!sidecar(&alias).exists());
+}
+
+#[tokio::test]
+async fn delete_through_a_symlink_removes_the_real_database_and_its_sidecars() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = overlay(dir.path(), "o.db").await;
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&db, &alias).unwrap();
+    write_session(&alias, "/work").await;
+    assert!(sidecar(&db).exists());
+    delete_overlay(opts(&alias)).await.unwrap();
+    assert!(!db.exists() && !sidecar(&db).exists() && !sidecar(&alias).exists());
+    assert!(alias.symlink_metadata().unwrap().is_symlink());
+}
+
 #[tokio::test]
 async fn path_fs_resolves_dot_dot_and_symlinks() {
     let dir = tempfile::tempdir().unwrap();
