@@ -1,5 +1,9 @@
 #![cfg(unix)]
 
+use agentfs::nfs::AgentNFS;
+use agentfs::nfsserve::nfs::{nfsstat3, sattr3};
+use agentfs::nfsserve::rpc::auth_unix;
+use agentfs::nfsserve::vfs::NFSFileSystem;
 use agentfs_sdk::{
     create_overlay, open_merged, AgentFSOptions, Base, FileSystem, MergedFS, PathFS,
 };
@@ -113,4 +117,29 @@ async fn diff_of_overlay_open_in_other_process_is_busy() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("overlay database is in use"));
     drop(merged);
+}
+
+#[tokio::test]
+async fn nfs_create_in_lower_only_dir_reports_exist_and_nametoolong() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = base_dir(dir.path());
+    std::fs::create_dir(base.join("d")).unwrap();
+    std::fs::write(base.join("d/x"), "x").unwrap();
+    let merged = overlay(&dir.path().join("o.db"), &base).await;
+    let d = merged.fs.lookup(1, "d").await.unwrap().unwrap().ino as u64;
+    let nfs = AgentNFS::new(Arc::new(tokio::sync::Mutex::new(merged.fs.clone())));
+    let (target, attr, auth) = (
+        b"t".as_slice().into(),
+        sattr3::default(),
+        auth_unix::default(),
+    );
+
+    let exists = nfs
+        .symlink(d, &b"x".as_slice().into(), &target, &attr, &auth)
+        .await;
+    assert!(matches!(exists, Err(nfsstat3::NFS3ERR_EXIST)));
+    let long = nfs
+        .symlink(d, &vec![b'a'; 256].into(), &target, &attr, &auth)
+        .await;
+    assert!(matches!(long, Err(nfsstat3::NFS3ERR_NAMETOOLONG)));
 }

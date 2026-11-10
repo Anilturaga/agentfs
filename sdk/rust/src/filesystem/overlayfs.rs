@@ -765,6 +765,17 @@ impl OverlayFS {
         }
     }
 
+    /// `EEXIST` if the merged view already has an entry `name` in `parent_ino`
+    async fn ensure_absent(&self, parent_ino: i64, name: &str) -> Result<()> {
+        if name.len() > super::MAX_NAME_LEN {
+            return Err(FsError::NameTooLong.into());
+        }
+        match self.lookup(parent_ino, name).await? {
+            Some(_) => Err(FsError::AlreadyExists.into()),
+            None => Ok(()),
+        }
+    }
+
     /// Ensure parent directories exist in delta layer
     async fn ensure_parent_dirs(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
         let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -1227,10 +1238,7 @@ impl FileSystem for OverlayFS {
         let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
         let path = self.build_path(parent_ino, name)?;
 
-        // Check if already exists
-        if self.lookup(parent_ino, name).await?.is_some() {
-            return Err(FsError::AlreadyExists.into());
-        }
+        self.ensure_absent(parent_ino, name).await?;
 
         // Ensure parent dirs exist in delta
         self.ensure_parent_dirs(&path, uid, gid).await?;
@@ -1264,6 +1272,7 @@ impl FileSystem for OverlayFS {
 
         let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
         let path = self.build_path(parent_ino, name)?;
+        self.ensure_absent(parent_ino, name).await?;
 
         // Ensure parent dirs exist in delta
         self.ensure_parent_dirs(&path, uid, gid).await?;
@@ -1300,6 +1309,7 @@ impl FileSystem for OverlayFS {
 
         let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
         let path = self.build_path(parent_ino, name)?;
+        self.ensure_absent(parent_ino, name).await?;
 
         self.ensure_parent_dirs(&path, uid, gid).await?;
 
@@ -1333,6 +1343,7 @@ impl FileSystem for OverlayFS {
 
         let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
         let path = self.build_path(parent_ino, name)?;
+        self.ensure_absent(parent_ino, name).await?;
 
         self.ensure_parent_dirs(&path, uid, gid).await?;
 
@@ -1440,6 +1451,7 @@ impl FileSystem for OverlayFS {
             .get_inode_info(newparent_ino)
             .ok_or(FsError::NotFound)?;
         let new_path = self.build_path(newparent_ino, newname)?;
+        self.ensure_absent(newparent_ino, newname).await?;
 
         if info.layer == Layer::Base {
             return Err(errno(libc::EXDEV));
@@ -3519,6 +3531,68 @@ mod tests {
         assert!(overlay.lookup(ROOT_INO, "subdir").await?.is_none());
         let names = overlay.readdir(moved.ino).await?.unwrap();
         assert_eq!(names, ["nested.txt", "new.txt"]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_create_over_lower_entry_is_eexist() -> Result<()> {
+        let (overlay, _base_dir, _delta_dir) = create_test_overlay().await?;
+        let (n, _) = overlay
+            .create_file(ROOT_INO, "n", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        let errno = |r: Result<()>| r.err().and_then(|e| e.errno());
+        let (file, dir) = ("base.txt", "subdir");
+
+        for name in [file, dir] {
+            let got = [
+                errno(
+                    overlay
+                        .create_file(ROOT_INO, name, 0o644, 0, 0)
+                        .await
+                        .map(drop),
+                ),
+                errno(
+                    overlay
+                        .mknod(ROOT_INO, name, 0o10644, 0, 0, 0)
+                        .await
+                        .map(drop),
+                ),
+                errno(overlay.symlink(ROOT_INO, name, "x", 0, 0).await.map(drop)),
+                errno(overlay.link(n.ino, ROOT_INO, name).await.map(drop)),
+            ];
+            assert_eq!(got, [Some(libc::EEXIST); 4], "{name}");
+        }
+
+        assert!(overlay.lookup(ROOT_INO, file).await?.unwrap().is_file());
+        assert!(overlay.lookup(ROOT_INO, dir).await?.unwrap().is_directory());
+        assert!(FileSystem::lookup(overlay.delta(), 1, file)
+            .await?
+            .is_none());
+        assert!(FileSystem::lookup(overlay.delta(), 1, dir).await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overlay_create_under_delta_dir_over_non_directory_lower() -> Result<()> {
+        let (overlay, base_dir, _delta_dir) = create_test_overlay().await?;
+        let (n, _) = overlay
+            .create_file(ROOT_INO, "n", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        let upper = overlay.mkdir(ROOT_INO, "upper", 0o755, 0, 0).await?;
+        std::fs::write(base_dir.path().join("upper"), b"now a file")?;
+
+        overlay
+            .create_file(upper.ino, "a", DEFAULT_FILE_MODE, 0, 0)
+            .await?;
+        overlay.mknod(upper.ino, "b", 0o10644, 0, 0, 0).await?;
+        overlay.symlink(upper.ino, "c", "x", 0, 0).await?;
+        overlay.link(n.ino, upper.ino, "d").await?;
+
+        for name in ["a", "b", "c", "d"] {
+            assert!(overlay.lookup(upper.ino, name).await?.is_some(), "{name}");
+        }
 
         Ok(())
     }

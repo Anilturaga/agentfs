@@ -43,6 +43,7 @@
     {"id": 40, "steps": ["write /f new", "close", "hostRm /f", "hostMkdir /f", "hostWrite /f/x x", "openMerged db", "diff => M f /f; D f /f/x"]},
     {"id": 41, "xfail_py": [46], "steps": ["createOverlay dir/a.db base", "openMerged dir/a.db base", "write /n 1", "close", "openMerged dir/a.db other => ESTALE", "rebindOverlay dir/a.db other", "openMerged dir/a.db", "read /n => 1"]},
     {"id": 42, "steps": ["i = stat /d ino", "write /d/x x2", "stat /d ino => $i", "plus / d ino => $i"]},
-    {"id": 43, "steps": ["mkdir /k", "write /k/a 1", "close", "hostWrite /k x", "openMerged db", "readdir /k => a", "write /k/b 2", "diff => M d /k; A f /k/a; A f /k/b"]}
+    {"id": 43, "steps": ["mkdir /k", "write /k/a 1", "close", "hostWrite /k x", "openMerged db", "readdir /k => a", "write /k/b 2", "diff => M d /k; A f /k/a; A f /k/b"]},
+    {"id": 44, "steps": ["write /n 1", "symlink x /f => EEXIST", "symlink x /d => EEXIST", "link /n /f => EEXIST", "reopen", "read /f => base", "readdir /d => sub x", "diff => A f /n"]}
   ]
 }
