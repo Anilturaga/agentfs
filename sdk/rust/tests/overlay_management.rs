@@ -546,3 +546,26 @@ async fn create_races_child_opener_with_other_base() {
     assert!(!seen.contains("opened"));
     child.wait().unwrap();
 }
+
+#[tokio::test]
+async fn path_fs_file_calls_on_a_directory_are_eisdir() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("base/d")).unwrap();
+    let (db, _) = overlay(dir.path(), "o.db").await;
+    let merged = open_merged(opts(&db), None).await.unwrap();
+    let plain = AgentFS::open(opts(&dir.path().join("p.db"))).await.unwrap();
+    let overlaid = PathFS(Arc::new(merged.fs.clone()));
+    let plain = PathFS(Arc::new(plain.fs.clone()));
+    plain.mkdir("/d").await.unwrap();
+
+    for paths in [&overlaid, &plain] {
+        let size = paths.stat("/d").await.unwrap().unwrap().size;
+        for dir in ["/d", "/"] {
+            let written = paths.write_file(dir, b"clobbered").await;
+            assert_eq!(errno(written), Some(libc::EISDIR));
+            assert_eq!(errno(paths.read_file(dir).await), Some(libc::EISDIR));
+        }
+        assert_eq!(paths.stat("/d").await.unwrap().unwrap().size, size);
+    }
+    assert!(merged.diff().await.unwrap().is_empty());
+}

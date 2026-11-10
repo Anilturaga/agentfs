@@ -114,3 +114,25 @@ async fn diff_of_overlay_open_in_other_process_is_busy() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("overlay database is in use"));
     drop(merged);
 }
+
+#[tokio::test]
+async fn fs_write_and_cat_on_a_directory_are_eisdir() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = base_dir(dir.path());
+    std::fs::create_dir(base.join("d")).unwrap();
+    let db = dir.path().join("o.db");
+    drop(overlay(&db, &base).await);
+    let db = db.to_str().unwrap();
+
+    let attempts: [&[&str]; 3] = [
+        &["write", "/d", "clobbered"],
+        &["write", "/", "clobbered"],
+        &["cat", "/d"],
+    ];
+    for attempt in attempts {
+        let out = agentfs(dir.path(), &[&["fs", db], attempt].concat());
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Is a directory"));
+    }
+    assert_eq!(stdout(&agentfs(dir.path(), &["diff", db])), "No changes\n");
+}

@@ -957,4 +957,24 @@ mod tests {
         };
         assert_eq!(server.handle_read_file(params).await.unwrap(), "from base");
     }
+
+    #[tokio::test]
+    async fn write_file_on_a_directory_is_eisdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = AgentFSOptions::with_path(dir.path().join("p.db").to_str().unwrap());
+        let opened = open_fs(db, None).await.unwrap();
+        let server = McpServer::new(opened, None);
+        server.fs.mkdir("/d").await.unwrap();
+        let params = |path: &str| WriteFileParams {
+            path: path.to_string(),
+            content: "clobbered".to_string(),
+            encoding: None,
+            create_dirs: None,
+        };
+        for path in ["/d", "/"] {
+            let err = server.handle_write_file(params(path)).await.unwrap_err();
+            assert!(format!("{err:#}").contains("Is a directory"));
+        }
+        assert_eq!(server.fs.stat("/d").await.unwrap().unwrap().size, 0);
+    }
 }
