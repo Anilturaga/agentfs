@@ -342,7 +342,6 @@ impl AgentFS {
 
         let mut db_path = options.db_path()?;
 
-        // A caller that passes `held` has resolved the path it reserved.
         let held = match held {
             None => {
                 db_path = connection_pool::resolve(&db_path)?;
