@@ -372,6 +372,9 @@ impl PathFS {
         let Some(stats) = self.stat(path).await? else {
             return Ok(None);
         };
+        if stats.is_directory() {
+            return Err(FsError::IsADirectory.into());
+        }
         let file = self.0.open(stats.ino, libc::O_RDONLY).await?;
         Ok(Some(file.pread(0, stats.size as u64).await?))
     }
@@ -379,6 +382,7 @@ impl PathFS {
     /// Replaces the content of the file at `path`, creating it with mode 0644 if absent.
     pub async fn write_file(&self, path: &str, data: &[u8]) -> Result<()> {
         let file = match self.stat(path).await? {
+            Some(stats) if stats.is_directory() => return Err(FsError::IsADirectory.into()),
             Some(stats) => self.0.open(stats.ino, libc::O_RDWR).await?,
             None => {
                 let (dir, name) = self.creation_site(path).await?;

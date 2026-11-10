@@ -142,7 +142,7 @@ impl McpServer {
                     "id": id,
                     "error": {
                         "code": -32603,
-                        "message": e.to_string()
+                        "message": format!("{e:#}")
                     }
                 })
             }
@@ -956,5 +956,34 @@ mod tests {
             encoding: None,
         };
         assert_eq!(server.handle_read_file(params).await.unwrap(), "from base");
+    }
+
+    #[tokio::test]
+    async fn file_tools_on_a_directory_report_eisdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = AgentFSOptions::with_path(dir.path().join("p.db").to_str().unwrap());
+        let opened = open_fs(db, None).await.unwrap();
+        let server = McpServer::new(opened, None);
+        server.fs.mkdir("/d").await.unwrap();
+        let call = |tool: &str, path: &str| {
+            let arguments = json!({ "path": path, "content": "clobbered" });
+            let params = json!({ "name": tool, "arguments": arguments });
+            let request =
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params });
+            server.handle_request(request)
+        };
+        for (tool, path) in [
+            ("write_file", "/d"),
+            ("write_file", "/"),
+            ("read_file", "/d"),
+        ] {
+            let response = call(tool, path).await.unwrap();
+            let message = response["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("Is a directory"),
+                "{tool} {path}: {message}"
+            );
+        }
+        assert_eq!(server.fs.stat("/d").await.unwrap().unwrap().size, 0);
     }
 }
