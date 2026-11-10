@@ -37,6 +37,7 @@ _LEGACY = (
 )
 _SIDECARS = ("-wal", "-shm", "-log", "-wal-revert", "-info", "-changes")
 _held: dict[tuple[int, int], "OverlayInfo | None"] = {}
+_parked: dict[tuple[int, int], list[int]] = {}
 
 
 def _fail(code: FsErrorCode, syscall: FsSyscall, path: str | None = None) -> NoReturn:
@@ -170,22 +171,32 @@ class _Lock:
 
     db: Connection | None = None
     key: tuple[int, int] | None = None
-    fd: int | None = None
 
     def _pin(self, path: str, syscall: FsSyscall) -> None:
         """Opens and locks the existing file, so a delete cannot run before the engine opens it."""
         try:
-            self.fd = os.open(path, os.O_RDWR)
-            fcntl.lockf(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            same = [(s.st_dev, s.st_ino) for s in (os.fstat(self.fd), os.stat(path))]
+            fd = os.open(path, os.O_RDWR)
+            st = os.fstat(fd)
+            key = (st.st_dev, st.st_ino)
+            if key in _held:
+                # Closing a descriptor of a held file would drop its holder's lock.
+                _parked.setdefault(key, []).append(fd)
+            else:
+                os.close(fd)
+            if key != self.key:
+                _fail("ENOENT", syscall, path)
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            now = os.stat(path)
         except FileNotFoundError:
             _fail("ENOENT", syscall, path)
         except OSError as e:
             if e.errno not in (errno.EACCES, errno.EAGAIN):
                 raise
             _fail("EBUSY", syscall, path)
-        if same != [self.key] * 2:
+        if (now.st_dev, now.st_ino) != self.key:
             _fail("ENOENT", syscall, path)
+        if now.st_nlink > 1:
+            _fail("ENOTSUP", syscall, path)
 
     async def take(self, path: str, syscall: FsSyscall, create: bool = False) -> None:
         try:
@@ -197,8 +208,6 @@ class _Lock:
             key = (st.st_dev, st.st_ino)
             if key in _held:
                 _fail("EBUSY", syscall, path)
-            if st.st_nlink > 1:
-                _fail("ENOTSUP", syscall, path)
             self.key = key
             _held[key] = None
             self._pin(path, syscall)
@@ -220,9 +229,9 @@ class _Lock:
             traceback.clear_frames(sys.exc_info()[2])
             gc.collect()
             _held.pop(self.key, None)
-            if self.fd is not None:
-                os.close(self.fd)
-            self.key = self.fd = None
+            for fd in _parked.pop(self.key, []):
+                os.close(fd)
+            self.key = None
 
 
 class OverlayFile:
@@ -743,10 +752,7 @@ async def _config(db: Connection) -> dict[str, str] | None:
 
 
 async def list_overlays(dir: DbPath, base: Base | None = None) -> list[OverlayInfo]:
-    """The overlay databases directly in `dir`, sorted by path; with `base`, only those over it.
-
-    A file that cannot be read, or that another process holds open, is left out.
-    """
+    """Overlays in `dir` (over `base`, if given) by path, omitting unreadable or busy ones."""
     lower = _lower(base) if base is not None else None
     identity = await lower.identity() if lower else None
     found = []
@@ -763,11 +769,9 @@ async def list_overlays(dir: DbPath, base: Base | None = None) -> list[OverlayIn
             else:
                 await lock.take(path, "list_overlays")
                 config = await _config(lock.db)
+                get = config.get
                 info = OverlayInfo(
-                    path,
-                    int(config.get("version", 0)),
-                    config["base_path"],
-                    config.get("base_identity", ""),
+                    path, int(get("version", 0)), config["base_path"], get("base_identity", "")
                 )
         except Exception:
             continue
@@ -802,10 +806,8 @@ async def rebind_overlay(db_path: DbPath, base: Base) -> None:
     try:
         await lock.take(path, "rebind_overlay")
         version = (await _config(lock.db) or {}).get("version")
-        if version is None:
-            _fail("EINVAL", "rebind_overlay", path)
         if version != "1":
-            _fail("ENOTSUP", "rebind_overlay", path)
+            _fail("EINVAL" if version is None else "ENOTSUP", "rebind_overlay", path)
         sql = "INSERT OR REPLACE INTO fs_overlay_config (key, value) VALUES (?, ?)"
         await lock.db.executemany(sql, rows)
         await lock.db.commit()

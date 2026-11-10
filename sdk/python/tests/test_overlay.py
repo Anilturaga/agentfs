@@ -2,6 +2,7 @@
 
 import asyncio
 import errno
+import fcntl
 import gc
 import json
 import os
@@ -715,3 +716,58 @@ async def test_listing_skips_entries_that_disappear(tmp_path, overlay, monkeypat
     assert [i.path for i in await list_overlays(tmp_path)] == [str(overlay)]
     monkeypatch.undo()
     assert "gone.db" in seen and "notes.txt" not in seen
+
+
+async def test_failed_acquisition_keeps_the_lock_of_the_owner(tmp_path, base, overlay, monkeypatch):
+    other = tmp_path / "other.db"
+    await create_overlay(other, base)
+    link = tmp_path / "link"
+    link.symlink_to(other)
+    real_open, real_connect, seen = os.open, overlay_module.connect, []
+
+    def retarget(path, *args, **kwargs):
+        if str(path) == str(link):
+            link.unlink()
+            link.symlink_to(overlay)
+        return real_open(path, *args, **kwargs)
+
+    async def acquire_meanwhile(path):
+        if not seen:
+            monkeypatch.setattr(os, "open", retarget)
+            seen.append(await code(open_merged(link, base)))
+            monkeypatch.setattr(os, "open", real_open)
+            seen.append(child_delete_code(overlay))
+        return await real_connect(path)
+
+    monkeypatch.setattr(overlay_module, "connect", acquire_meanwhile)
+    assert [i.path for i in await list_overlays(tmp_path)] == [str(overlay), str(other)]
+    monkeypatch.undo()
+    assert seen == ["ENOENT", "EBUSY"]
+    assert overlay.exists()
+
+
+@pytest.mark.parametrize("hook", ["open", "lockf"])
+async def test_late_hard_link_is_refused(hook, tmp_path, base, overlay, monkeypatch):
+    alias = tmp_path / "alias"
+    owner = os if hook == "open" else fcntl
+    real = getattr(owner, hook)
+
+    def link_around(*args, **kwargs):
+        if hook == "open" and str(args[0]) == str(overlay):
+            os.link(overlay, alias)
+        result = real(*args, **kwargs)
+        if hook == "lockf":
+            os.link(overlay, alias)
+        return result
+
+    for operation in (
+        lambda: open_merged(overlay, base),
+        lambda: delete_overlay(overlay),
+        lambda: rebind_overlay(overlay, base),
+    ):
+        monkeypatch.setattr(owner, hook, link_around)
+        assert await code(operation()) == "ENOTSUP"
+        monkeypatch.undo()
+        alias.unlink()
+        assert overlay.exists()
+    assert child_opens(overlay, base)
